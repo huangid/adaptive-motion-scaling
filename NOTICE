@@ -1,0 +1,12 @@
+adaptive-motion-scaling
+
+This project is derived from Residual Copilot
+(https://github.com/shuosha/Residual_Copilot), released under the Apache License 2.0,
+by way of huangid/vla-shared-autonomy, which modified and extended it.
+
+Changes from the original include a SpaceMouse teleoperation pilot, additional
+block-manipulation tasks, SmolVLA policy integration, shared-autonomy and evaluation
+scripts, and the motion-scaling work in this repository.
+
+third_party/lerobot is a git submodule of LeRobot (https://github.com/huggingface/lerobot),
+distributed under its own license.

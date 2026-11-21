@@ -1,0 +1,350 @@
+"""Convert recorded JSON rollouts into the kNN .npy dataset format.
+
+Reads logs/rollouts/<dir>/episode_XXXX/robot/*.json, keeps only successful
+episodes (per meta/stats.json), and writes a single .npy dict the kNN pilot
+can load.
+
+Recorded RGB frames are **copied** into a persistent store next to the .npy:
+
+    <output_stem>_frames/episode_<npy_idx:05d>/{000000.jpg, ...}
+
+This matters because `play.py --record` wipes and reuses the same rollout
+directory on every run, so a sidecar that merely *pointed* at the rollout dir
+would go stale as soon as the next demo was recorded.
+
+Alongside the .npy it writes a sidecar "<output>.tasks.json" mapping each npy
+episode index to:
+  - task:       the natural-language instruction (RandomBlock single-target)
+  - frames:     path of the copied per-episode RGB directory
+  - steps:      number of timesteps kept (== number of frames copied)
+  - block_xy:   all three block spawn positions, when recorded
+  - target_idx: index of the instructed block, when recorded
+  - source/episode: the originating rollout dir + episode name (provenance only)
+
+The sidecar is kept out of the .npy because the kNN loader tensorizes every key
+in an episode dict. npy_to_lerobot.py reads it to attach per-episode
+instructions and to locate the RGB frames.
+"""
+import argparse
+import hashlib
+import json
+import os
+import shutil
+import signal
+from pathlib import Path
+
+import numpy as np
+
+parser = argparse.ArgumentParser()
+parser.add_argument("--rollout_dir", type=str, required=True,
+                    help="Path to logs/rollouts/<dir>")
+parser.add_argument("--output", type=str, required=True,
+                    help="Output .npy path")
+parser.add_argument("--all", action="store_true",
+                    help="Include all episodes, not just successful ones")
+parser.add_argument("--append", action="store_true",
+                    help="Append to existing output instead of overwriting.")
+parser.add_argument("--views", type=str, default=None,
+                    help='Multi-camera recordings: comma-separated "name:subdir" pairs, e.g. '
+                         '"wrist:camera_wrist/rgb,side:camera_side/rgb". Each view is copied to '
+                         "its own persistent frames store and recorded in the sidecar as "
+                         "frames_<name> / n_frames_<name>, so npy_to_lerobot can attach one "
+                         "image key per view. Overrides --camera_subdir when given.")
+parser.add_argument("--camera_subdir", type=str, default="camera_0/rgb",
+                    help="Per-episode subdir holding the recorded RGB frames.")
+parser.add_argument("--no_frames", action="store_true",
+                    help="Skip copying RGB frames (state/action only).")
+parser.add_argument("--no_clamp_actions", action="store_true",
+                    help="Store the raw pilot command instead of clamping it to the executable "
+                         "workspace. Off by default: the sim clamps every target, so unclamped "
+                         "commands (e.g. z below the table) are targets that were never executed.")
+parser.add_argument("--action_prefix", type=str, default="base_action",
+                    choices=["base_action", "exec_action", "policy_action", "human", "blend"],
+                    help="Which recorded action stream becomes the BC target. Shared-autonomy "
+                         "rollouts (scripts/shared_autonomy.py) log all of them. The study pair "
+                         "is `human` (D_human) vs `blend` (D_blend): both take the policy's own "
+                         "action on non-corrective steps and differ ONLY on the selected "
+                         "corrective ones — a_H for human, a_exec for blend. The bare "
+                         "`base_action` / `exec_action` / `policy_action` take that stream on "
+                         "every step; play.py rollouts only have base_action.")
+parser.add_argument("--angle_threshold", type=float, default=0.0,
+                    help="With --action_prefix human/blend: a step counts as corrective only if "
+                         "the human was intervening AND the logged direction disagreement is at "
+                         "least this many degrees. 0 keeps every intervention. Use the SAME value "
+                         "for both datasets, or they differ by more than the label under test.")
+parser.add_argument("--keep_last_step", action="store_true",
+                    help="Keep the final recorded timestep. Off by default because DirectRLEnv "
+                         "resets inside the step that reports `done` and _get_observations() runs "
+                         "after that reset, so the last recorded obs/action/frame actually belong "
+                         "to the NEXT episode.")
+args = parser.parse_args()
+
+# Must match XArmEnv._apply_residual / XArmEnvGuidedDiffusion._pre_physics_step.
+POS_CLAMP_LO = np.array([-0.2, -0.6, 0.0], dtype=np.float32)
+POS_CLAMP_HI = np.array([1.0, 0.6, 0.8], dtype=np.float32)
+GRIP_CLAMP_LO, GRIP_CLAMP_HI = 0.0, 1.0
+
+# Episodes shorter than this are dropped — a near-empty trajectory is a recording
+# glitch, and it would produce a zero/one-frame LeRobot episode downstream.
+MIN_STEPS = 5
+
+rollout = Path(args.rollout_dir).resolve()
+output = Path(args.output)
+frames_root = output.parent / f"{output.stem}_frames"
+
+# Which camera views to carry through. Single-view recordings keep the historical
+# layout exactly ("front" -> <output>_frames/episode_NNNNN, sidecar keys frames /
+# n_frames), so existing datasets and npy_to_lerobot calls are unaffected.
+if args.views:
+    VIEWS = []
+    for spec in args.views.split(","):
+        if ":" not in spec:
+            raise SystemExit(f"--views entry {spec!r} is not name:subdir")
+        name, sub = spec.split(":", 1)
+        VIEWS.append((name.strip(), sub.strip()))
+else:
+    VIEWS = [("front", args.camera_subdir)]
+
+
+def _frames_dir(view_name, npy_idx):
+    base = frames_root if view_name == "front" else frames_root.with_name(
+        f"{frames_root.name}_{view_name}")
+    return base / f"episode_{npy_idx:05d}"
+
+# Which episodes succeeded, plus instruction / layout metadata — from meta/stats.json.
+stats = {}
+meta_stats = rollout / "meta" / "stats.json"
+if meta_stats.exists():
+    stats = json.loads(meta_stats.read_text())
+
+OBS_KEYS = [
+    "obs.fingertip_pos", "obs.fingertip_quat", "obs.gripper",
+    "obs.fingertip_pos_rel_fixed", "obs.fingertip_pos_rel_held",
+    "obs.ee_linvel_fd", "obs.ee_angvel_fd",
+]
+
+# base_action.* is the pilot command computed from THIS timestep's observation, so
+# (obs_t, base_action_t) is the correctly paired BC sample. (The recording also stores
+# action.* = what the env executed during step t, but that derives from base_action_{t-1}
+# and is therefore lagged by one — do not use it as the BC target.)
+# --action_prefix selects the stream: base_action (human / teleop pilot), exec_action
+# (the blend that actually ran) or policy_action (the VLA's own proposal). Only
+# shared-autonomy rollouts carry the latter two.
+#
+# `human` and `blend` are per-timestep rather than a single stream, for two reasons.
+#
+# First, a shared-autonomy recording holds base_action = "hold this pose" on every step
+# the human was NOT touching the SpaceMouse — ~78% of steps in the first session.
+# Training on those as human intent would teach the policy to stop moving.
+#
+# Second, both datasets must fall back to the SAME thing off the selected steps, or
+# they would differ by more than the label under test. Taking exec_action on every step
+# for D_blend leaves it disagreeing with D_human on interventions that the threshold
+# excluded. So: selected step -> a_H (human) / a_exec (blend); every other step -> the
+# policy's own action, identically in both. The two datasets then share every
+# observation and differ on exactly the selected corrective steps.
+_SEL_MODE = args.action_prefix in ("human", "blend")
+_HUMAN_MODE = _SEL_MODE            # buffers/meta handling is the same for both
+_P = {"human": "base_action", "blend": "exec_action"}.get(args.action_prefix,
+                                                         args.action_prefix)
+ACT_SRC_KEYS = [f"{_P}.fingertip_pos", f"{_P}.fingertip_quat", f"{_P}.gripper"]
+_POLICY_KEYS = ["policy_action.fingertip_pos", "policy_action.fingertip_quat",
+                "policy_action.gripper"]
+
+# D_human takes its GRIPPER from the executed action, never from base_action.
+#
+# The SpaceMouse reports a latched open/closed state, not an intent: a driver who
+# steers position and leaves grasping to the policy emits `gripper = 0.0` (open) on
+# every step. Measured on the first 50-episode session that was literally all 4,144
+# steps, so taking base_action.gripper labelled 154 corrective steps (21% of them)
+# "hold the gripper OPEN" at the moments the policy was closing — i.e. D_human taught
+# the model not to grasp. The executed gripper is the right label in both cases: it is
+# the policy's when the human left grasping alone (as here), and the human's during the
+# --grip_hold_steps window after they do press a button.
+_HUMAN_ACT_SRC = [ACT_SRC_KEYS[0], ACT_SRC_KEYS[1], "exec_action.gripper"] \
+    if args.action_prefix == "human" else ACT_SRC_KEYS
+# Target keys the kNN format expects
+ACT_DST_KEYS = ["action.fingertip_pos", "action.fingertip_quat", "action.gripper"]
+# Keys we accumulate per timestep (ACT_SRC_KEYS names the action slots; in selection
+# mode their VALUES may come from a different stream per step).
+ALL_SRC_KEYS = OBS_KEYS + ACT_SRC_KEYS + (_POLICY_KEYS if _HUMAN_MODE else [])
+# Keys a timestep must contain to be usable — a superset, since D_human reads
+# exec_action.gripper without buffering it under its own name.
+REQUIRED_KEYS = ALL_SRC_KEYS + (["exec_action.gripper"] if args.action_prefix == "human" else [])
+if args.action_prefix != "base_action":
+    print(f"[INFO] BC target stream: {args.action_prefix}"
+          + (f" (human command where intervening and angle >= {args.angle_threshold:.0f} deg, "
+             f"policy action elsewhere)" if _HUMAN_MODE else ".*"))
+
+data = {}
+start_idx = 0
+tasks_path = Path(str(args.output) + ".tasks.json")
+new_meta = {}
+existing_meta = {}
+if args.append and Path(args.output).exists():
+    existing = np.load(args.output, allow_pickle=True).item()
+    data = dict(existing)
+    start_idx = max(existing.keys()) + 1 if existing else 0
+    print(f"Appending to {len(data)} existing episodes.")
+    if tasks_path.exists():
+        for k, v in json.loads(tasks_path.read_text()).items():
+            existing_meta[int(k)] = {"task": v} if isinstance(v, str) else v  # tolerate old flat format
+
+ep_dirs = sorted([d for d in rollout.iterdir() if d.name.startswith("episode_")])
+kept = 0
+skipped_duplicate = 0
+for ep_dir in ep_dirs:
+    ep_name = ep_dir.name
+    ep_stats = stats.get(ep_name, {})
+    if not args.all and stats and not bool(ep_stats.get("success", False)):
+        continue  # skip failed episodes
+
+    robot_dir = ep_dir / "robot"
+    step_files = sorted(robot_dir.glob("*.json"))
+    if not step_files:
+        continue
+
+    buffers = {k: [] for k in ALL_SRC_KEYS}
+    kept_step_idx = []  # original timestep index of each kept step, for frame alignment
+    n_human_labelled = 0
+    for t, sf in enumerate(step_files):
+        entry = json.loads(sf.read_text())
+        if not all(k in entry for k in REQUIRED_KEYS):
+            continue  # skip incomplete timesteps (e.g. terminal step)
+        if _HUMAN_MODE:
+            # angle < 0 means "undefined" (no commanded motion to compare), not
+            # "disagreement of 0" — such a step counts only when no threshold is asked for.
+            _ang = entry.get("disagreement_angle_deg", -1.0)
+            corrective = bool(entry.get("intervening", False)) and (
+                _ang >= args.angle_threshold if _ang >= 0.0 else args.angle_threshold <= 0.0)
+            n_human_labelled += int(corrective)
+            src = _HUMAN_ACT_SRC if corrective else _POLICY_KEYS
+            for k_dst, k_src in zip(ACT_SRC_KEYS, src):
+                buffers[k_dst].append(entry[k_src])
+            for k in OBS_KEYS + _POLICY_KEYS:
+                if k not in ACT_SRC_KEYS:
+                    buffers[k].append(entry[k])
+        else:
+            for k in ALL_SRC_KEYS:
+                buffers[k].append(entry[k])
+        kept_step_idx.append(t)
+
+    # Drop the terminal sample: DirectRLEnv.step() calls _reset_idx() before
+    # _get_observations(), so on the step that reports `done` the recorded
+    # observation, action and RGB frame are all from the NEXT episode (they read
+    # back as the reset start pose with the gripper open).
+    if not args.keep_last_step and len(kept_step_idx) > 1:
+        for k in ALL_SRC_KEYS:
+            buffers[k].pop()
+        kept_step_idx.pop()
+
+    if len(kept_step_idx) < MIN_STEPS:
+        print(f"  SKIP {ep_name}: only {len(kept_step_idx)} usable timesteps.")
+        continue
+
+    # Build episode dict, renaming base_action.* -> action.*
+    ep_dict = {}
+    for k in OBS_KEYS:
+        ep_dict[k] = np.array(buffers[k], dtype=np.float32)
+    for src, dst in zip(ACT_SRC_KEYS, ACT_DST_KEYS):
+        ep_dict[dst] = np.array(buffers[src], dtype=np.float32)
+
+    # The env clamps every commanded target, so an unclamped pilot command (e.g. the
+    # SpaceMouse driving z below the table) is a target the sim never executed. Training
+    # on those teaches the policy to command into the table — and the eval env applies
+    # the same clamp, so the two action spaces must agree.
+    if not args.no_clamp_actions:
+        ep_dict["action.fingertip_pos"] = np.clip(
+            ep_dict["action.fingertip_pos"], POS_CLAMP_LO, POS_CLAMP_HI
+        )
+        ep_dict["action.gripper"] = np.clip(
+            ep_dict["action.gripper"], GRIP_CLAMP_LO, GRIP_CLAMP_HI
+        )
+
+    # Guard against converting the same recording twice: play.py --record always
+    # reuses the same rollout dir and episode name, so (source, episode) can't
+    # identify an episode — fingerprint the trajectory instead.
+    fingerprint = hashlib.sha1(
+        np.ascontiguousarray(ep_dict["obs.fingertip_pos"]).tobytes()
+    ).hexdigest()[:16]
+    if any(m.get("fingerprint") == fingerprint for m in existing_meta.values()):
+        print(f"  SKIP {ep_name}: already in {args.output} (fingerprint {fingerprint}).")
+        skipped_duplicate += 1
+        continue
+
+    npy_idx = start_idx + kept
+    data[npy_idx] = ep_dict
+
+    entry_meta = {
+        "source": str(rollout),
+        "episode": ep_name,
+        "steps": len(kept_step_idx),
+        "fingerprint": fingerprint,
+    }
+    if _HUMAN_MODE:
+        entry_meta["human_labelled_steps"] = n_human_labelled
+    for key in ("instruction", "block_xy", "target_idx"):
+        if key in ep_stats:
+            entry_meta["task" if key == "instruction" else key] = ep_stats[key]
+
+    # Copy the RGB frames out of the volatile rollout dir into a persistent store,
+    # renumbered to match the kept timesteps one-for-one. One store per view.
+    if not args.no_frames:
+        for view_name, subdir in VIEWS:
+            rgb_src = ep_dir / subdir
+            if not rgb_src.is_dir():
+                if view_name != "front":
+                    print(f"  WARNING: {ep_name}: no {subdir} for view '{view_name}'")
+                continue
+            src_frames = sorted(set(sorted(rgb_src.glob("*.jpg")) + sorted(rgb_src.glob("*.png"))))
+            dst_dir = _frames_dir(view_name, npy_idx)
+            if dst_dir.exists():
+                shutil.rmtree(dst_dir)
+            dst_dir.mkdir(parents=True, exist_ok=True)
+            n_copied = 0
+            for new_t, orig_t in enumerate(kept_step_idx):
+                if orig_t >= len(src_frames):
+                    break
+                shutil.copy2(src_frames[orig_t],
+                             dst_dir / f"{new_t:06d}{src_frames[orig_t].suffix}")
+                n_copied += 1
+            suffix = "" if view_name == "front" else f"_{view_name}"
+            entry_meta[f"frames{suffix}"] = str(dst_dir)
+            entry_meta[f"n_frames{suffix}"] = n_copied
+            if n_copied != len(kept_step_idx):
+                print(f"  WARNING: {ep_name}/{view_name}: copied {n_copied} frames "
+                      f"for {len(kept_step_idx)} steps.")
+
+    new_meta[npy_idx] = entry_meta
+    kept += 1
+
+if kept == 0 and skipped_duplicate:
+    print(f"Nothing to do: all {skipped_duplicate} episode(s) were already converted. "
+          f"{args.output} still has {len(data)} episodes.")
+elif kept == 0:
+    print("WARNING: no episodes kept. Use --all to include unsuccessful ones, "
+          "or check that episodes succeeded.")
+else:
+    output.parent.mkdir(parents=True, exist_ok=True)
+    all_meta = {**existing_meta, **new_meta}
+
+    # The .npy and its .tasks.json sidecar must change together: npy_to_lerobot
+    # takes each episode's instruction from the sidecar by index, so a sidecar that
+    # lags the .npy mislabels every later episode. Write both to temp files, then
+    # swap them in with Ctrl-C ignored, so an interrupt (e.g. from a collection
+    # loop) can neither truncate the dataset nor leave the pair out of sync.
+    npy_tmp = output.with_name(output.name + ".tmp.npy")
+    tasks_tmp = tasks_path.with_name(tasks_path.name + ".tmp")
+    prev_sigint = signal.signal(signal.SIGINT, signal.SIG_IGN)
+    try:
+        np.save(npy_tmp, data, allow_pickle=True)
+        tasks_tmp.write_text(json.dumps({str(k): v for k, v in sorted(all_meta.items())}, indent=2))
+        os.replace(npy_tmp, output)
+        os.replace(tasks_tmp, tasks_path)
+    finally:
+        signal.signal(signal.SIGINT, prev_sigint)
+
+    print(f"Added {kept} new episodes. Total now: {len(data)} in {args.output}")
+    if not args.no_frames:
+        print(f"Copied RGB frames into {frames_root}/")
+    print(f"Wrote per-episode task/provenance for {len(all_meta)} episodes to {tasks_path}")

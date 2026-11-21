@@ -1,0 +1,846 @@
+"""Play a pilot model, optionally with a copilot (residual RL) on top."""
+
+import argparse
+import cv2
+import json
+import numpy as np
+import os
+import sys
+import time
+
+from isaaclab.app import AppLauncher
+
+parser = argparse.ArgumentParser(description="Play a pilot model, optionally with a copilot on top.")
+parser.add_argument("--task", type=str, required=True, choices=["GearMesh", "GearMeshIntent", "PegInsert", "NutThread", "ThreeBlocks", "RandomBlock"])
+parser.add_argument("--pilot", type=str, required=True,
+                    choices=["LaggyPilot", "NoisyPilot", "ExpertPilot", "BCPilot", "kNNPilot", "ReplayPilot", "ResidualPilot", "SpaceMousePilot"],
+                    help="Pilot (base) model to run.")
+parser.add_argument("--copilot", type=str, default=None,
+                    choices=["GuidedDiffusionBC", "GuidedDiffusionExpert", "DiSCo", "ResidualBC", "ResidualCopilot"],
+                    help="Copilot (residual RL) model to load. If omitted, runs pilot-only with zero residual.")
+parser.add_argument("--checkpoint", type=str, default=None,
+                    help="Local checkpoint path to override the HuggingFace download for RL-Games copilots "
+                         "(ResidualBC, ResidualCopilot). Ignored for guided-diffusion copilots and pilot-only.")
+parser.add_argument("--num_envs", type=int, default=1, help="Number of parallel environments.")
+parser.add_argument("--record", action="store_true", default=False,
+                    help="Record rollouts: save episode stats and RGB images to logs/rollouts/.")
+parser.add_argument("--no_rand", action="store_true", default=False, help="Disable domain randomization (keep sim deterministic).")
+parser.add_argument("--seed", type=int, default=None,
+                    help="Environment seed. Omit for a fresh random seed each run (so randomized tasks like "
+                         "RandomBlock actually vary between runs); pass an int to reproduce a specific rollout.")
+parser.add_argument("--vis_obs", action="store_true", default=False,
+                    help="Enable held/target visualization markers. NOTE: these are rendered into the "
+                         "scene, so they also land in the recorded camera frames — and the held marker "
+                         "sits exactly on the target block, which is a direct answer key for a policy "
+                         "trained on those images. Never combine with --record for learning data.")
+parser.add_argument("--target_color", type=str, default=None, choices=["red", "green", "blue"],
+                    help="RandomBlock: force every episode to target this colour instead of letting it "
+                         "be drawn at random. One episode per launch means the dataset's colour balance "
+                         "is left to chance and drifts (the first 100 demos came out 46 green / 33 blue "
+                         "/ 21 red); use this to top up whichever colour is short.")
+parser.add_argument("--yes", "-y", action="store_true", default=False,
+                    help="Overwrite an existing rollout directory without prompting. Needed when "
+                         "--record runs inside a collection loop, where the interactive prompt "
+                         "would block waiting on stdin.")
+parser.add_argument("--layout_seed", type=int, default=None,
+                    help="RandomBlock: reuse ONE block layout for every episode this run. Combine with "
+                         "--target_color to record the same scene under different instructions, which "
+                         "is what forces the policy to read the instruction instead of the layout.")
+parser.add_argument("--two_cam", action="store_true", default=False,
+                    help="Record the two-camera setup (wrist + square-on side view) INSTEAD of the "
+                         "calibrated front camera. Datasets recorded with and without this are not "
+                         "interchangeable: a policy trained on one cannot run in the other.")
+parser.add_argument("--wrist_camera", action="store_true", default=False,
+                    help="Add the gripper-mounted wrist view to whatever else is enabled.")
+parser.add_argument("--side_camera", action="store_true", default=False,
+                    help="Add the square-on side view to whatever else is enabled.")
+AppLauncher.add_app_launcher_args(parser)
+# suppress verbose Kit/USD logs by default
+parser.set_defaults(kit_args="--/log/level=error --/log/fileLogLevel=error --/log/outputStreamLevel=error")
+args_cli, hydra_args = parser.parse_known_args()
+sys.argv = [sys.argv[0]] + hydra_args
+if args_cli.record:
+    args_cli.enable_cameras = True
+    if args_cli.vis_obs:
+        print("\n" + "!" * 78)
+        print("!! --vis_obs WITH --record: the held/target gizmos will be baked into every")
+        print("!! recorded camera frame, and the held gizmo sits ON the target block. A policy")
+        print("!! trained on these images learns to follow the marker, not the task, and will")
+        print("!! collapse at eval where no markers are drawn. Drop --vis_obs.")
+        print("!" * 78 + "\n")
+
+import random as _random
+if args_cli.seed is None:
+    args_cli.seed = _random.randint(0, 2**31 - 1)
+print(f"[INFO] Environment seed: {args_cli.seed}")
+
+app_launcher = AppLauncher(args_cli)
+simulation_app = app_launcher.app
+
+import math
+
+import gymnasium as gym
+import torch
+from isaaclab_tasks.utils.hydra import hydra_task_config
+
+import residual_copilot  # noqa: F401
+
+# ANSI color codes
+_BOLD = "\033[1m"
+_CYAN = "\033[96m"
+_GREEN = "\033[92m"
+_YELLOW = "\033[93m"
+_RESET = "\033[0m"
+
+from residual_copilot.utils.constants import PILOT_NAME_MAP
+
+COPILOT_NAME_MAP = {
+    "GuidedDiffusionBC":     ("GuidedDiffusion", f"shared_autonomy_policies/bc_teleop/{args_cli.task}_bc_teleop"),
+    "DiSCo":                 ("GuidedDiffusion", f"shared_autonomy_policies/bc_teleop/{args_cli.task}_bc_teleop"),
+    "GuidedDiffusionExpert": ("GuidedDiffusion", f"shared_autonomy_policies/bc_expert/{args_cli.task}_bc_expert"),
+    "ResidualBC":            ("Residual",        f"shared_autonomy_policies/residual_copilot/{args_cli.task}_bc_teleop/nn/FactoryXarm.pth"),
+    "ResidualCopilot":       ("Residual",        f"shared_autonomy_policies/residual_copilot/{args_cli.task}_noisy_knn/nn/FactoryXarm.pth"),
+}
+
+
+def _apply_task_overrides(env_cfg):
+    """Apply --target_color / --layout_seed / camera selection to the env cfg."""
+    if args_cli.two_cam:
+        env_cfg.use_wrist_camera = True
+        env_cfg.use_upper_right_camera = True
+        env_cfg.use_front_camera = False
+        print("[INFO] two-camera setup: wrist + side, front camera OFF")
+    else:
+        if args_cli.wrist_camera:
+            env_cfg.use_wrist_camera = True
+        if args_cli.side_camera:
+            env_cfg.use_upper_right_camera = True
+
+    task_cfg = env_cfg.task
+    if args_cli.target_color is not None:
+        colors = getattr(task_cfg, "target_colors", None)
+        if not colors or args_cli.target_color not in colors:
+            raise SystemExit(f"--target_color is not supported by task {args_cli.task}")
+        idx = colors.index(args_cli.target_color)
+        task_cfg.allowed_target_idx = (idx,)
+        print(f"[INFO] Target colour forced to {args_cli.target_color} (block index {idx})")
+    if args_cli.layout_seed is not None:
+        if not hasattr(task_cfg, "layout_seed"):
+            raise SystemExit(f"--layout_seed is not supported by task {args_cli.task}")
+        task_cfg.layout_seed = args_cli.layout_seed
+        print(f"[INFO] Block layout fixed to layout_seed={args_cli.layout_seed}")
+
+
+def _print_run_info(task, pilot_model, copilot_model, num_envs):
+    copilot_str = copilot_model if copilot_model else "none (pilot-only)"
+    num_envs_str = str(num_envs) if num_envs is not None else "default"
+    border = _BOLD + _CYAN + "=" * 52 + _RESET
+    print(border)
+    print(f"{_BOLD}{_CYAN}{'  RESIDUAL COPILOT — RUN CONFIG':^52}{_RESET}")
+    print(border)
+    print(f"  {_BOLD}Task       :{_RESET}  {_GREEN}{task}{_RESET}")
+    print(f"  {_BOLD}Pilot      :{_RESET}  {_GREEN}{pilot_model}{_RESET}")
+    print(f"  {_BOLD}Copilot    :{_RESET}  {_YELLOW}{copilot_str}{_RESET}")
+    print(f"  {_BOLD}Num envs   :{_RESET}  {num_envs_str}")
+    print(border)
+
+
+def _episode_meta_snapshot(env_unwrapped):
+    """Capture per-env episode metadata at episode START.
+
+    DirectRLEnv.step() calls _reset_idx() inside the same step that reports
+    `done`, so by the time the recording loop exits, the env's instruction /
+    target / block layout have already advanced to the *next* episode. These
+    must be read before the episode runs, not after.
+    """
+    num_envs = env_unwrapped.num_envs
+    snap = [{} for _ in range(num_envs)]
+
+    instructions = getattr(env_unwrapped, "instructions", None)
+    target_idx = getattr(env_unwrapped, "target_block_idx", None)
+    # rb_block_xy is allocated for every three_blocks task but only filled when
+    # positions are randomized — otherwise it is all zeros and would be misleading.
+    block_xy = (
+        getattr(env_unwrapped, "rb_block_xy", None)
+        if getattr(env_unwrapped.cfg_task, "randomize_positions", False) else None
+    )
+
+    for env_id in range(num_envs):
+        if instructions is not None:
+            snap[env_id]["instruction"] = instructions[env_id]
+        if target_idx is not None:
+            snap[env_id]["target_idx"] = int(target_idx[env_id].item())
+        if block_xy is not None:
+            snap[env_id]["block_xy"] = block_xy[env_id].detach().cpu().tolist()
+    return snap
+
+
+def _make_rollout_dir():
+    """Create and return the rollout output directory path.
+
+    If the directory already exists, prompt the user for confirmation before
+    overwriting.  Exits if the user declines.
+    """
+    task = args_cli.task
+    pilot = args_cli.pilot
+    copilot = args_cli.copilot
+    if copilot is not None:
+        dir_name = f"eval_{task}_with_{copilot}_and_{pilot}"
+    else:
+        dir_name = f"eval_{task}_with_{pilot}"
+    
+    if args_cli.no_rand:
+        dir_name += "_no_rand"
+    rollout_path = os.path.abspath(os.path.join("logs", "rollouts", dir_name))
+
+    if os.path.exists(rollout_path):
+        print(f"{_YELLOW}[WARNING]{_RESET} Rollout directory already exists:\n  {rollout_path}")
+        if args_cli.yes:
+            print("Overwriting (--yes).")
+        else:
+            answer = input("Overwrite? [y/N] ").strip().lower()
+            if answer != "y":
+                print("Aborting.")
+                sys.exit(0)
+        import shutil
+        shutil.rmtree(rollout_path)
+
+    os.makedirs(rollout_path, exist_ok=True)
+    return rollout_path
+
+
+# Each enabled camera writes to its own subdir. camera_0 stays the front view so
+# existing rollouts, convert_demos defaults and the 650 recorded episodes keep working;
+# the optional views get their own directories rather than renumbering anything.
+# Keyed on the SENSOR objects, which exist from env construction. The *_rgb buffers
+# are only populated inside _compute_intermediate_values during the first step, so
+# keying on those left this empty at setup time: no directories, no frames.
+CAMERA_DIRS = {"front_camera": "camera_0", "wrist_camera": "camera_wrist",
+               "upper_right_camera": "camera_side"}
+
+
+def _enabled_camera_views(env_unwrapped):
+    """[(camera_attr, subdir)] for every camera this env is actually rendering."""
+    return [(a, d) for a, d in CAMERA_DIRS.items()
+            if getattr(env_unwrapped, a, None) is not None]
+
+
+def _save_rollout_meta(rollout_path, ep_stats):
+    """Write meta/infos.json and meta/stats.json into rollout_path."""
+    meta_dir = os.path.join(rollout_path, "meta")
+    os.makedirs(meta_dir, exist_ok=True)
+
+    infos = {
+        "task": args_cli.task,
+        "pilot": args_cli.pilot,
+        "copilot": args_cli.copilot,
+        "num_envs": args_cli.num_envs,
+    }
+    with open(os.path.join(meta_dir, "infos.json"), "w") as f:
+        json.dump(infos, f, indent=2)
+
+    with open(os.path.join(meta_dir, "stats.json"), "w") as f:
+        json.dump(ep_stats, f, indent=2)
+
+    successes = sum(1 for v in ep_stats.values() if v["success"])
+    total = len(ep_stats)
+    print(f"[INFO] Saved rollout meta to: {meta_dir}")
+    print(f"[INFO] Success rate: {successes}/{total}")
+
+
+def _format_timestep(obs, base_actions, env_actions, qpos):
+    """Build a structured dict for one env at one timestep.
+
+    Args:
+        obs: flat policy observation (35D) for this env.
+        base_actions: base_actions (8D) for this env.
+        env_actions: env_actions (8D) for this env.
+        qpos: qpos_targets (7D) for this env.
+
+    Obs layout (from obs_order + prev_actions, total 35D):
+        fingertip_pos          [0:3]
+        fingertip_quat         [3:7]
+        gripper                [7:8]
+        fingertip_pos_rel_fixed [8:11]
+        fingertip_pos_rel_held  [11:14]
+        ee_linvel_fd           [14:17]
+        ee_angvel_fd           [17:20]
+        base_fingertip_pos     [20:23]   (from obs; may differ from base_actions
+        base_fingertip_quat    [23:27]    after noise/lag augmentation is applied
+        base_gripper           [27:28]    within the same step)
+        prev_actions           [28:35]
+    """
+    return {
+        "obs.fingertip_pos":          obs[0:3].tolist(),
+        "obs.fingertip_quat":         obs[3:7].tolist(),
+        "obs.gripper":                obs[7:8].tolist(),
+        "obs.fingertip_pos_rel_fixed": obs[8:11].tolist(),
+        "obs.fingertip_pos_rel_held": obs[11:14].tolist(),
+        "obs.ee_linvel_fd":           obs[14:17].tolist(),
+        "obs.ee_angvel_fd":           obs[17:20].tolist(),
+        "obs.qpos":                   qpos.tolist(),
+        "base_action.fingertip_pos":  base_actions[0:3].tolist(),
+        "base_action.fingertip_quat": base_actions[3:7].tolist(),
+        "base_action.gripper":        base_actions[7:8].tolist(),
+        "action.fingertip_pos":       env_actions[0:3].tolist(),
+        "action.fingertip_quat":      env_actions[3:7].tolist(),
+        "action.gripper":             env_actions[7:8].tolist(),
+        "action.qpos":               qpos.tolist(),
+    }
+
+
+def _build_dp_obs(env_unwrapped):
+    """Build LeRobot-format obs dict from env tensors for the diffusion policy."""
+    return {
+        "observation.state": torch.cat([
+            env_unwrapped.fingertip_midpoint_pos,
+            env_unwrapped.fingertip_midpoint_quat,
+            env_unwrapped.gripper,
+            env_unwrapped.ee_linvel_fd,
+            env_unwrapped.ee_angvel_fd,
+        ], dim=-1),
+        "observation.environment_state": torch.cat([
+            env_unwrapped.fingertip_midpoint_pos - env_unwrapped.fixed_pos_obs_frame,
+            env_unwrapped.fingertip_midpoint_pos - env_unwrapped.held_pos_obs_frame,
+        ], dim=-1),
+    }
+
+
+def _run_loop_guided_diffusion(env, env_unwrapped, policy):
+    """Run guided diffusion eval loop (no recording)."""
+    num_envs = env_unwrapped.num_envs
+    obs, _ = env.reset()
+    episode_done = torch.zeros(num_envs, dtype=torch.bool, device=env_unwrapped.device)
+    global_step = 0
+
+    while simulation_app.is_running():
+        with torch.inference_mode():
+            dp_obs = _build_dp_obs(env_unwrapped)
+            base_actions = env_unwrapped.base_actions
+            is_idle = getattr(env_unwrapped.pilot, "is_idle", False)
+            actions = policy.act(dp_obs, ref_action=base_actions, is_idle=is_idle)
+
+            obs, _rew, terminated, truncated, _info = env.step(actions)
+            dones = terminated | truncated
+
+            if dones.any():
+                policy.reset()
+
+            episode_done |= dones.bool()
+            n_done = int(episode_done.sum().item())
+            print(f"\r[Step {global_step:5d}]  done: {n_done}/{num_envs}  ongoing: {num_envs - n_done}/{num_envs}", end="", flush=True)
+            global_step += 1
+
+            if torch.all(episode_done):
+                print()
+                print("[INFO] All episodes completed.")
+                break
+
+
+def _run_loop_recording(env_unwrapped, step_fn, on_done_fn, rollout_path):
+    """Shared recording loop for all copilot types.
+
+    Args:
+        env_unwrapped: unwrapped DirectRLEnv with .num_envs, .base_actions, etc.
+        step_fn: callable() -> (obs_snapshot_np, dones_tensor) — advance one step and
+                 return the observation snapshot (numpy, shape [N, obs_dim]) and dones.
+        on_done_fn: callable(dones) — called after each step with the dones tensor
+                    (e.g. to reset a diffusion policy).
+        rollout_path: directory path to write episode data into.
+
+    Returns:
+        ep_stats dict suitable for _save_rollout_meta().
+    """
+    num_envs = env_unwrapped.num_envs
+    episode_done = torch.zeros(num_envs, dtype=torch.bool, device=env_unwrapped.device)
+    success_ts = [-1] * num_envs
+    timesteps = [0] * num_envs
+    global_step = 0
+
+    # Must be read now — _reset_idx advances these inside the step that ends the episode.
+    ep_meta = _episode_meta_snapshot(env_unwrapped)
+
+    store_rgb = env_unwrapped.cfg.vis.store_rgb
+
+    robot_buffers = [[] for _ in range(num_envs)]
+    for env_id in range(num_envs):
+        if store_rgb:
+            os.makedirs(os.path.join(rollout_path, f"episode_{env_id:04d}", "camera_0", "rgb"), exist_ok=True)
+        os.makedirs(os.path.join(rollout_path, f"episode_{env_id:04d}", "robot"), exist_ok=True)
+
+    while simulation_app.is_running():
+        with torch.inference_mode():
+            obs_snap_np, dones = step_fn()
+
+            base_act_np = env_unwrapped.base_actions.detach().cpu().numpy()
+            env_act_np = env_unwrapped.env_actions.detach().cpu().numpy()
+            qpos_np = env_unwrapped.qpos_targets.detach().cpu().numpy()
+            # This path (copilot/kNN recording) is single-view by construction; it is
+            # only reachable with the front camera on.
+            img_np_all = (env_unwrapped.front_rgb.cpu().numpy()
+                          if store_rgb and getattr(env_unwrapped, "front_camera", None) is not None
+                          else None)
+
+            for env_id in range(num_envs):
+                if episode_done[env_id]:
+                    continue
+
+                done = bool(dones[env_id].item())
+                t = timesteps[env_id]
+
+                robot_buffers[env_id].append(_format_timestep(
+                    obs_snap_np[env_id],
+                    base_act_np[env_id],
+                    env_act_np[env_id],
+                    qpos_np[env_id],
+                ))
+
+                if store_rgb and img_np_all is not None:
+                    rgb_dir = os.path.join(rollout_path, f"episode_{env_id:04d}", "camera_0", "rgb")
+                    img_bgr = cv2.cvtColor(img_np_all[env_id], cv2.COLOR_RGB2BGR)
+                    cv2.imwrite(os.path.join(rgb_dir, f"{t:06d}.jpg"), img_bgr)
+
+                if done:
+                    ep_succeeded = bool(env_unwrapped.ep_succeeded[env_id].item())
+                    if ep_succeeded and success_ts[env_id] == -1:
+                        success_ts[env_id] = t
+                    episode_done[env_id] = True
+
+                    robot_dir = os.path.join(rollout_path, f"episode_{env_id:04d}", "robot")
+                    for step_t, entry in enumerate(robot_buffers[env_id]):
+                        with open(os.path.join(robot_dir, f"{step_t:06d}.json"), "w") as f:
+                            json.dump(entry, f, indent=2)
+
+                    # print(
+                    #     f"[INFO] Episode {env_id} done at step {t}, succeeded: {ep_succeeded}"
+                    # )
+                else:
+                    timesteps[env_id] += 1
+
+            on_done_fn(dones)
+
+        n_done = int(episode_done.sum().item())
+        print(f"\r[Step {global_step:5d}]  done: {n_done}/{num_envs}  ongoing: {num_envs - n_done}/{num_envs}", end="", flush=True)
+        global_step += 1
+
+        if torch.all(episode_done):
+            print()
+            print("[INFO] All episodes completed.")
+            break
+
+    return {
+        f"episode_{env_id:04d}": {
+            "success": success_ts[env_id] != -1,
+            "success_timestep": success_ts[env_id],
+            **ep_meta[env_id],
+        }
+        for env_id in range(num_envs)
+    }
+
+
+def _run_loop_plain(env, env_unwrapped, agent):
+    """Run the eval loop without recording."""
+    num_envs = env_unwrapped.num_envs
+    obs = env.reset()
+    if isinstance(obs, dict):
+        obs = obs["obs"]
+    _ = agent.get_batch_size(obs, 1)
+    if agent.is_rnn:
+        agent.init_rnn()
+
+    episode_done = torch.zeros(num_envs, dtype=torch.bool, device=env_unwrapped.device)
+    global_step = 0
+
+    while simulation_app.is_running():
+        with torch.inference_mode():
+            obs = agent.obs_to_torch(obs)
+            actions = agent.get_action(obs, is_deterministic=agent.is_deterministic)
+            obs, _rew, dones, _info = env.step(actions)
+
+            episode_done |= dones.bool() if isinstance(dones, torch.Tensor) else torch.tensor(dones, dtype=torch.bool, device=env_unwrapped.device)
+            n_done = int(episode_done.sum().item())
+            print(f"\r[Step {global_step:5d}]  done: {n_done}/{num_envs}  ongoing: {num_envs - n_done}/{num_envs}", end="", flush=True)
+            global_step += 1
+
+
+def main():
+    _print_run_info(args_cli.task, args_cli.pilot, args_cli.copilot, args_cli.num_envs)
+
+    pilot_type, pilot_model_key = PILOT_NAME_MAP[args_cli.pilot]
+
+    rollout_path = _make_rollout_dir() if args_cli.record else None
+
+    if args_cli.copilot is not None:
+        # --- copilot mode ---
+        from residual_copilot.utils.utils import resolve_hf
+        from residual_copilot.xarm_assembly_env.assembly_tasks_cfg import HF_MODELS_REPO
+
+        method, hf_path = COPILOT_NAME_MAP[args_cli.copilot]
+        task_id = f"XArm-{args_cli.task}-{method}"
+        if args_cli.checkpoint is not None and method in ("Residual", "GuidedDiffusion"):
+            resume_path = os.path.abspath(args_cli.checkpoint)
+            if not os.path.exists(resume_path):
+                raise FileNotFoundError(f"--checkpoint not found: {resume_path}")
+            print(f"[INFO] Using local checkpoint: {resume_path}")
+        else:
+            resume_path = resolve_hf(HF_MODELS_REPO, hf_path, repo_type="model")
+
+        if method == "GuidedDiffusion":
+            # --- guided diffusion copilot (DiffusionPolicy, not RL-Games) ---
+            from residual_copilot.pilot_models.bc_pilot import BC_Pilot
+
+            @hydra_task_config(task_id, "rl_games_cfg_entry_point")
+            def _run(env_cfg, agent_cfg):
+                if args_cli.num_envs is not None:
+                    env_cfg.scene.num_envs = args_cli.num_envs
+
+                env_cfg.seed = args_cli.seed
+                _apply_task_overrides(env_cfg)
+
+                env_cfg.pilot_model = pilot_model_key
+                env_cfg.pilot_type = pilot_type
+
+                if args_cli.record:
+                    env_cfg.vis.store_rgb = True
+
+                if args_cli.no_rand:
+                    env_cfg.dmr.rand_ctrl = False
+                    env_cfg.dmr.aug_data = False
+                    env_cfg.vis.order_envs = True
+
+                # Authoritative: the cfg default is True, and markers render into the
+                # recorded camera frames. Never let it fall through implicitly.
+                env_cfg.vis.vis_obs = args_cli.vis_obs
+
+                env = gym.make(task_id, cfg=env_cfg)
+                env.unwrapped.cfg_task.success_rotation_threshold_deg = 180.0
+
+                if args_cli.copilot == "DiSCo":
+                    from residual_copilot.pilot_models.disco_pilot import DiSCo_Pilot
+                    policy = DiSCo_Pilot(resume_path)
+                else:
+                    policy = BC_Pilot(resume_path)
+
+                if args_cli.record:
+                    env_u = env.unwrapped
+                    state = [env.reset()[0]]  # state[0] = obs (mutable box)
+
+                    def step_fn():
+                        obs = state[0]
+                        obs_policy = obs["policy"] if isinstance(obs, dict) else obs
+                        obs_snap = obs_policy.detach().cpu().numpy()
+                        dp_obs = _build_dp_obs(env_u)
+                        actions = policy.act(dp_obs, ref_action=env_u.base_actions)
+                        obs, _rew, terminated, truncated, _info = env.step(actions)
+                        state[0] = obs
+                        return obs_snap, terminated | truncated
+
+                    def on_done_fn(dones):
+                        if dones.any():
+                            policy.reset()
+
+                    ep_stats = _run_loop_recording(env_u, step_fn, on_done_fn, rollout_path)
+                    _save_rollout_meta(rollout_path, ep_stats)
+                else:
+                    _run_loop_guided_diffusion(env, env.unwrapped, policy)
+
+                env.close()
+
+            _run()
+
+        else:
+            # --- RL-Games copilot (ResidualBC, ResidualCopilot) ---
+            from rl_games.common import env_configurations, vecenv
+            from rl_games.common.player import BasePlayer
+            from rl_games.torch_runner import Runner
+
+            from isaaclab_rl.rl_games import RlGamesGpuEnv, RlGamesVecEnvWrapper
+
+            @hydra_task_config(task_id, "rl_games_cfg_entry_point")
+            def _run(env_cfg, agent_cfg):
+                if args_cli.num_envs is not None:
+                    env_cfg.scene.num_envs = args_cli.num_envs
+
+                env_cfg.seed = args_cli.seed
+                _apply_task_overrides(env_cfg)
+
+                env_cfg.pilot_model = pilot_model_key
+                env_cfg.pilot_type = pilot_type
+
+                if args_cli.record:
+                    env_cfg.vis.store_rgb = True
+
+                if args_cli.no_rand:
+                    env_cfg.dmr.rand_ctrl = False
+                    env_cfg.dmr.aug_data = False
+                    env_cfg.vis.order_envs = True
+
+                # Authoritative: the cfg default is True, and markers render into the
+                # recorded camera frames. Never let it fall through implicitly.
+                env_cfg.vis.vis_obs = args_cli.vis_obs
+
+                env = gym.make(task_id, cfg=env_cfg)
+                env.unwrapped.cfg_task.success_rotation_threshold_deg = 180.0
+
+                rl_device = agent_cfg["params"]["config"]["device"]
+                clip_obs = agent_cfg["params"]["env"].get("clip_observations", math.inf)
+                clip_actions = agent_cfg["params"]["env"].get("clip_actions", math.inf)
+                obs_groups = agent_cfg["params"]["env"].get("obs_groups")
+                concate_obs_groups = agent_cfg["params"]["env"].get("concate_obs_groups", True)
+
+                env = RlGamesVecEnvWrapper(env, rl_device, clip_obs, clip_actions, obs_groups, concate_obs_groups)
+
+                vecenv.register(
+                    "IsaacRlgWrapper",
+                    lambda config_name, num_actors, **kwargs: RlGamesGpuEnv(config_name, num_actors, **kwargs),
+                )
+                env_configurations.register("rlgpu", {"vecenv_type": "IsaacRlgWrapper", "env_creator": lambda **kwargs: env})
+
+                agent_cfg["params"]["load_checkpoint"] = True
+                agent_cfg["params"]["load_path"] = resume_path
+                agent_cfg["params"]["config"]["num_actors"] = env.unwrapped.num_envs
+
+                runner = Runner()
+                runner.load(agent_cfg)
+                agent: BasePlayer = runner.create_player()
+                agent.restore(resume_path)
+                agent.reset()
+
+                if args_cli.record:
+                    obs = env.reset()
+                    if isinstance(obs, dict):
+                        obs = obs["obs"]
+                    _ = agent.get_batch_size(obs, 1)
+                    if agent.is_rnn:
+                        agent.init_rnn()
+                    env_u = env.unwrapped
+                    state = [obs]  # state[0] = obs (mutable box)
+
+                    def step_fn():
+                        obs = state[0]
+                        obs_snap = obs.clone() if not isinstance(obs, dict) else obs["obs"].clone()
+                        obs = agent.obs_to_torch(obs)
+                        actions = agent.get_action(obs, is_deterministic=agent.is_deterministic)
+                        obs, _rew, dones, _info = env.step(actions)
+                        state[0] = obs
+                        return obs_snap.detach().cpu().numpy(), dones
+
+                    ep_stats = _run_loop_recording(env_u, step_fn, lambda _: None, rollout_path)
+                    _save_rollout_meta(rollout_path, ep_stats)
+                else:
+                    _run_loop_plain(env, env.unwrapped, agent)
+
+                env.close()
+
+            _run()
+
+    else:
+        # --- pilot-only mode (zero residual) ---
+        task_id = f"XArm-{args_cli.task}-Residual"
+
+        @hydra_task_config(task_id, "rl_games_cfg_entry_point")
+        def _run(env_cfg, agent_cfg):
+            if args_cli.num_envs is not None:
+                env_cfg.scene.num_envs = args_cli.num_envs
+
+            env_cfg.seed = args_cli.seed
+            _apply_task_overrides(env_cfg)
+
+            env_cfg.pilot_model = pilot_model_key
+            env_cfg.pilot_type = pilot_type
+
+            if args_cli.record:
+                env_cfg.vis.store_rgb = True
+            # Authoritative: the cfg default is True, and markers render into the
+            # recorded camera frames. Never let it fall through implicitly.
+            env_cfg.vis.vis_obs = args_cli.vis_obs
+
+            if args_cli.no_rand:
+                env_cfg.dmr.rand_ctrl = False
+                env_cfg.dmr.aug_data = False
+                env_cfg.vis.order_envs = True
+
+            env = gym.make(task_id, cfg=env_cfg)
+            env.unwrapped.cfg_task.success_rotation_threshold_deg = 180.0
+
+            zero_actions = torch.zeros(
+                (env.unwrapped.num_envs, env.unwrapped.cfg.action_space),
+                device=env.unwrapped.device,
+            )
+
+            num_envs = env.unwrapped.num_envs
+            env_unwrapped = env.unwrapped
+
+            if args_cli.record:
+                store_rgb = env_unwrapped.cfg.vis.store_rgb
+                episode_done = torch.zeros(num_envs, dtype=torch.bool, device=env_unwrapped.device)
+                success_ts = [-1] * num_envs
+                timesteps = [0] * num_envs
+                global_step = 0
+
+                robot_buffers = [[] for _ in range(num_envs)]
+                for env_id in range(num_envs):
+                    if store_rgb:
+                        for _a, _sub in _enabled_camera_views(env_unwrapped):
+                            os.makedirs(os.path.join(rollout_path, f"episode_{env_id:04d}",
+                                                     _sub, "rgb"), exist_ok=True)
+                    os.makedirs(os.path.join(rollout_path, f"episode_{env_id:04d}", "robot"), exist_ok=True)
+
+                obs, _ = env.reset()
+                # Must be read now — _reset_idx advances instruction/target/layout inside
+                # the step that ends the episode.
+                ep_meta = _episode_meta_snapshot(env_unwrapped)
+
+                while simulation_app.is_running():
+                    with torch.inference_mode():
+                        # DEBUG (tmp): snapshot episode_idx BEFORE step, since _reset_idx
+                        # auto-advances it post-step for done envs.
+                        _pre_step_eps_idx = env_unwrapped.episode_idx.clone()
+
+                        obs, _rew, terminated, truncated, _info = env.step(zero_actions)
+                        dones = terminated | truncated
+
+                        # DEBUG (tmp): per-env obj-tgt distance from env's own assembly_error,
+                        # which is computed in _get_dones BEFORE the auto-reset that clobbers held_pos.
+                        obj_tgt_dist_dbg = env_unwrapped.assembly_error
+                        # END DEBUG
+
+                        obs_policy = obs["policy"] if isinstance(obs, dict) else obs
+                        obs_np = obs_policy.detach().cpu().numpy()
+                        base_act_np = env_unwrapped.base_actions.detach().cpu().numpy()
+                        env_act_np = env_unwrapped.env_actions.detach().cpu().numpy()
+                        qpos_np = env_unwrapped.qpos_targets.detach().cpu().numpy()
+
+                        for env_id in range(num_envs):
+                            if episode_done[env_id]:
+                                continue
+
+                            done = dones[env_id].item()
+                            t = timesteps[env_id]
+
+                            o = obs_np[env_id]
+                            ba = base_act_np[env_id]
+                            ea = env_act_np[env_id]
+                            robot_buffers[env_id].append({
+                                "obs.fingertip_pos":           o[0:3].tolist(),
+                                "obs.fingertip_quat":          o[3:7].tolist(),
+                                "obs.gripper":                 o[7:8].tolist(),
+                                "obs.fingertip_pos_rel_fixed": o[8:11].tolist(),
+                                "obs.fingertip_pos_rel_held":  o[11:14].tolist(),
+                                "obs.ee_linvel_fd":            o[14:17].tolist(),
+                                "obs.ee_angvel_fd":            o[17:20].tolist(),
+                                "obs.qpos":                    qpos_np[env_id].tolist(),
+                                # base_action = the raw pilot (human) command, pre-clamp.
+                                "base_action.fingertip_pos":   ba[0:3].tolist(),
+                                "base_action.fingertip_quat":  ba[3:7].tolist(),
+                                "base_action.gripper":         ba[7:8].tolist(),
+                                # action = what the env actually executed (post workspace +
+                                # gripper clamp). This is the correct BC target, and the
+                                # a_exec side of the shared-autonomy study.
+                                "action.fingertip_pos":        ea[0:3].tolist(),
+                                "action.fingertip_quat":       ea[3:7].tolist(),
+                                "action.gripper":              ea[7:8].tolist(),
+                            })
+
+                            if store_rgb:
+                                for _a, _sub in _enabled_camera_views(env_unwrapped):
+                                    rgb_dir = os.path.join(
+                                        rollout_path, f"episode_{env_id:04d}", _sub, "rgb")
+                                    cam = getattr(env_unwrapped, _a)
+                                    img = cam.data.output["rgb"][env_id].cpu().numpy()
+                                    cv2.imwrite(os.path.join(rgb_dir, f"{t:06d}.jpg"),
+                                                cv2.cvtColor(img, cv2.COLOR_RGB2BGR))
+
+                            if done:
+                                ep_succeeded = bool(env_unwrapped.ep_succeeded[env_id].item())
+                                if ep_succeeded and success_ts[env_id] == -1:
+                                    success_ts[env_id] = t
+                                episode_done[env_id] = True
+
+                                robot_dir = os.path.join(rollout_path, f"episode_{env_id:04d}", "robot")
+                                for step_t, entry in enumerate(robot_buffers[env_id]):
+                                    with open(os.path.join(robot_dir, f"{step_t:06d}.json"), "w") as f:
+                                        json.dump(entry, f, indent=2)
+
+                                # DEBUG (tmp): success + obj-tgt distance conditioned on eps_idx
+                                _eps_idx = int(_pre_step_eps_idx[env_id].item())
+                                _intent_table = getattr(env_unwrapped, "eps_intent_table", None)
+                                _intent_id = int(_intent_table[_eps_idx].item()) if _intent_table is not None else -1
+                                _intent_lbl = {0: "small", 1: "medium", 2: "large", -1: "n/a"}[_intent_id]
+                                _dist = float(obj_tgt_dist_dbg[env_id].item())
+                                print(
+                                    f"\n[DBG] env={env_id} eps_idx={_eps_idx} intent={_intent_lbl} "
+                                    f"step={t} success={ep_succeeded} obj_tgt_dist={_dist:.4f}"
+                                )
+                                # END DEBUG
+                            else:
+                                timesteps[env_id] += 1
+
+                    n_done = int(episode_done.sum().item())
+                    print(f"\r[Step {global_step:5d}]  done: {n_done}/{num_envs}  ongoing: {num_envs - n_done}/{num_envs}", end="", flush=True)
+                    global_step += 1
+
+                    if torch.all(episode_done):
+                        print()
+                        print("[INFO] All episodes completed.")
+                        break
+
+                ep_stats = {
+                    f"episode_{env_id:04d}": {
+                        "success": success_ts[env_id] != -1,
+                        "success_timestep": success_ts[env_id],
+                        **ep_meta[env_id],
+                    }
+                    for env_id in range(num_envs)
+                }
+                _save_rollout_meta(rollout_path, ep_stats)
+
+            else:
+                obs, _ = env.reset()
+                episode_done = torch.zeros(num_envs, dtype=torch.bool, device=env_unwrapped.device)
+                timesteps = [0] * num_envs
+                global_step = 0
+
+                while simulation_app.is_running():
+                    with torch.inference_mode():
+                        # DEBUG (tmp): snapshot episode_idx BEFORE step, since _reset_idx
+                        # auto-advances it post-step for done envs.
+                        _pre_step_eps_idx = env_unwrapped.episode_idx.clone()
+
+                        obs, _rew, terminated, truncated, _info = env.step(zero_actions)
+                        dones = terminated | truncated
+
+                        # DEBUG (tmp): print success + obj-tgt distance per env at episode-done.
+                        # Read env's own assembly_error (set in _get_dones BEFORE auto-reset).
+                        _new_dones = dones.bool() & ~episode_done
+                        if _new_dones.any():
+                            _obj_tgt_dist_dbg = env_unwrapped.assembly_error
+                            _intent_table = getattr(env_unwrapped, "eps_intent_table", None)
+                            for _env_id in _new_dones.nonzero(as_tuple=True)[0].tolist():
+                                _succ = bool(env_unwrapped.ep_succeeded[_env_id].item())
+                                _eps_idx = int(_pre_step_eps_idx[_env_id].item())
+                                _intent_id = int(_intent_table[_eps_idx].item()) if _intent_table is not None else -1
+                                _intent_lbl = {0: "small", 1: "medium", 2: "large", -1: "n/a"}[_intent_id]
+                                _dist = float(_obj_tgt_dist_dbg[_env_id].item())
+                                print(
+                                    f"\n[DBG] env={_env_id} eps_idx={_eps_idx} intent={_intent_lbl} "
+                                    f"step={timesteps[_env_id]} success={_succ} obj_tgt_dist={_dist:.4f}"
+                                )
+                        for _i in range(num_envs):
+                            if not episode_done[_i]:
+                                timesteps[_i] += 1
+                        # END DEBUG
+
+                        episode_done |= dones.bool()
+                        n_done = int(episode_done.sum().item())
+                        print(f"\r[Step {global_step:5d}]  done: {n_done}/{num_envs}  ongoing: {num_envs - n_done}/{num_envs}", end="", flush=True)
+                        global_step += 1
+
+            env.close()
+
+        _run()
+
+
+if __name__ == "__main__":
+    main()
+    simulation_app.close()

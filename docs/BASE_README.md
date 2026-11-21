@@ -1,0 +1,1598 @@
+# Efficient and Reliable Teleoperation through Real2Sim2Real Shared Autonomy
+
+> **Inherited reference.** This is the README of the codebase this project was copied
+> from: the Residual Copilot code plus the earlier VLA shared-autonomy label study
+> (`huangid/vla-shared-autonomy`, branch `two-camera`). It is kept for its setup,
+> data-collection, training and evaluation commands. Links to `docs/OVERVIEW.md`,
+> `docs/RESULTS.md` and `docs/media/` point to files that were not carried over;
+> they live in the `vla-shared-autonomy` repo. The current project is described in
+> the top-level [README](../README.md).
+
+## Links
+
+- **Code:** https://github.com/shuosha/Residual_Copilot
+- **Paper:** https://arxiv.org/abs/2603.22787
+
+---
+
+## Table of Contents
+
+- [Installation](#installation)
+- [Quick Demo](#quick-demo)
+- [Inference](#inference)
+  - [Evaluating Pilot and Copilot Policies](#evaluating-pilot-and-copilot-policies)
+  - [Visualizing Residual Corrections](#visualizing-residual-corrections)
+  - [Real-world Deployment](#real-world-deployment)
+- [Training](#training)
+  - [Training Residual Copilot](#training-residual-copilot)
+  - [Training Guided Diffusion Copilot](#training-guided-diffusion-copilot)
+  - [Adding New Tasks and Models](#adding-new-tasks-and-models)
+- [Three Blocks: SpaceMouse Teleop Workflow](#three-blocks-spacemouse-teleop-workflow)
+- [RandomBlock: Randomized Block/Bin Task](#randomblock-randomized-blockbin-task)
+- [HuggingFace Collection](#huggingface-collection)
+
+## Installation
+
+### Prerequisites
+
+- Python 3.11
+- [uv](https://docs.astral.sh/uv/) package manager
+- CUDA 12.8 (matches IsaacSim 5.1.0 / PyTorch 2.7.0 cu128; for other versions see the [IsaacLab installation guide](https://isaac-sim.github.io/IsaacLab/main/source/setup/installation/index.html))
+
+### Setup
+
+```bash
+git clone --recurse-submodules https://github.com/shuosha/Residual_Copilot.git
+cd Residual_Copilot
+uv venv --python 3.11 --seed .venv
+source .venv/bin/activate
+UV_HTTP_TIMEOUT=300 uv sync   # Isaac Sim wheels are large; extended timeout prevents download failures
+```
+
+To verify that all environments are registered correctly:
+```bash
+python scripts/list_envs.py   # should list XArm-{GearMesh,NutThread,PegInsert}-{Residual,GuidedDiffusion}
+```
+
+> **First run:** Isaac Sim will prompt you to accept the EULA and will download/cache simulator assets, which may take several minutes.
+
+> **Note:** Isaac Sim can exhaust static TLS slots, causing `cannot allocate memory in static TLS block`. Preload `libgomp` before running any script:
+> ```bash
+> export LD_PRELOAD=/lib/x86_64-linux-gnu/libgomp.so.1
+> ```
+> The provided shell scripts handle this automatically.
+
+## Quick Demo
+
+Generate side-by-side comparison videos of the **Residual Copilot** vs. an unassisted **Replay** baseline:
+
+```bash
+bash scripts/demo_side_by_side.sh NutThread              # launches with Isaac Sim viewer
+bash scripts/demo_side_by_side.sh GearMesh --headless   # no viewer (for remote machines or no display)
+bash scripts/demo_side_by_side.sh PegInsert --no-clean  # keep intermediate files
+```
+
+Output: `logs/demos/<task>/demo_*.mp4` — annotated videos with action overlays (red = base action, pink = residual, blue = net).
+
+## Inference
+
+### Evaluating Pilot and Copilot Policies
+
+```bash
+# Pilot + copilot with recording
+python scripts/play.py \
+  --task NutThread --pilot kNNPilot --copilot ResidualCopilot \
+  --num_envs 16 --record
+
+# Pilot only
+python scripts/play.py --task NutThread --pilot kNNPilot --num_envs 16
+```
+
+**Arguments:** `--task` (`GearMesh` / `GearMeshIntent` / `PegInsert` / `NutThread` / `ThreeBlocks`), `--pilot` (see below), `--copilot` (optional), `--num_envs` (default 1), `--record` (save to `logs/rollouts/`), `--no_rand` (disable domain randomization), `--vis_obs` (show held/target visualization markers), `--checkpoint` (override the HF copilot download with a local path; applies to RL-Games copilots `ResidualBC` / `ResidualCopilot` as well as guided-diffusion copilots `GuidedDiffusionBC` / `GuidedDiffusionExpert` / `DiSCo`).
+
+`GearMeshIntent` is a gear-mesh variant where each demo episode targets one of three gear slots (small/medium/large); `ThreeBlocks` is a multi-goal block-sorting task (pick up to 3 blocks into a bin) primarily driven by `SpaceMousePilot` for live shared-autonomy teleop.
+
+**Pilots:**
+
+| Name | Description |
+|------|-------------|
+| `kNNPilot` | kNN Pilot |
+| `BCPilot` | Teleop BC policy |
+| `ExpertPilot` | Expert BC policy |
+| `NoisyPilot` | Expert BC + mistakeful behaviors (noisy actions) |
+| `LaggyPilot` | Expert BC + laggy behaviors (repeat actions) |
+| `ReplayPilot` | Replay recorded episodes |
+| `SpaceMousePilot` | Live human teleop via a 3Dconnexion SpaceMouse (real HID device required) |
+
+**Copilots:**
+
+| Name | Description |
+|------|-------------|
+| `ResidualCopilot` | Residual RL trained with Residual Copilot |
+| `ResidualBC` | Residual RL trained with BC  pilot |
+| `GuidedDiffusionBC` | Guided Diffusion trained on teleop data |
+| `GuidedDiffusionExpert` | Guided Diffusion trained on expert data |
+| `DiSCo` | Guided-diffusion copilot with DiSCo sampling (seed/inpaint toward the pilot's reference action) + beta-blend; used for live shared-autonomy assistance, e.g. with `SpaceMousePilot` on `ThreeBlocks` |
+
+All checkpoints are auto-downloaded from HuggingFace on first use. To evaluate a **local** RL-Games copilot checkpoint instead, pass `--checkpoint <path/to/FactoryXarm.pth>`:
+
+```bash
+python scripts/play.py \
+  --task GearMeshIntent --pilot NoisyPilot --copilot ResidualCopilot \
+  --checkpoint logs/rl_games/FactoryXarm/<run_name>/nn/FactoryXarm.pth \
+  --num_envs 15 --no_rand --record
+```
+
+Combined with `--no_rand`, envs are run in deterministic order (one episode per env), so `--num_envs N` evaluates exactly `N` ordered episodes.
+
+For guided-diffusion copilots (`GuidedDiffusionBC`/`GuidedDiffusionExpert`/`DiSCo`), `--checkpoint` points at a LeRobot `pretrained_model` directory instead of an RL-Games `.pth`:
+
+```bash
+# DiSCo copilot assisting a live SpaceMouse pilot, from a locally-trained checkpoint
+python scripts/play.py \
+  --task ThreeBlocks --pilot SpaceMousePilot --copilot DiSCo --num_envs 1 \
+  --checkpoint outputs/train/threeblocks_expert_50_bc_expert/checkpoints/060000/pretrained_model
+```
+
+### Visualizing Residual Corrections
+
+**Per-episode and collage videos** from recorded rollouts:
+
+```bash
+# <recording_dir> is created by `play.py --record` under logs/rollouts/,
+# named eval_<task>_with_<copilot>_and_<pilot> (e.g. eval_GearMesh_with_ResidualCopilot_and_kNNPilot)
+
+# Annotated single-episode videos
+python scripts/vis/to_videos.py \
+  logs/rollouts/<recording_dir> \
+  --single --annotate
+
+# Collage grid
+python scripts/vis/to_videos.py \
+  logs/rollouts/<recording_dir> \
+  --collage --annotate --cols 4 --scale 0.5
+```
+
+When `--annotate` is enabled, action arrows are drawn per frame: **red** = base action, **pink** = residual, **blue** = net action.
+
+### Real-world Deployment
+
+See [Residual_Copilot_Deployment](https://github.com/shuosha/Residual_Copilot_Deployment) for real-world setup, hardware configuration, and deployment instructions.
+
+## Training
+
+### Training Residual Copilot
+
+Train the RL residual copilot using PPO with a pilot model:
+
+```bash
+python scripts/train.py \
+  --task XArm-GearMesh-Residual \
+  --pilot kNNPilot \
+  --num_envs 128 \
+  --headless
+```
+
+**Arguments:** `--task` (full gym ID, e.g. `XArm-GearMesh-Residual`), `--pilot` (pilot model), `--num_envs` (default 128), `--checkpoint` (resume), `--distributed` (multi-GPU), `--track` (W&B logging), `--wandb_project_name` (W&B project name, defaults to task config name), `--wandb_name` (W&B experiment name, defaults to log directory). Logs saved to `logs/rl_games/`.
+
+### Training Guided Diffusion Copilot
+
+Diffusion policies are trained with [LeRobot](https://github.com/huggingface/lerobot). Training data can either come from successful rollout data of an existing policy or real-world data collected using the [deployment repo](https://github.com/shuosha/Residual_Copilot_Deployment).
+
+**1. Collect data:**
+
+```bash
+python scripts/collect_data.py \
+  --task GearMesh --pilot kNNPilot \
+  --num_envs 16 --num_episodes 500 \
+  --output_dir logs/data/gearmesh_knn_500 --headless
+```
+
+**2. Augment (optional):**
+
+```bash
+python scripts/augment_data.py \
+  --in logs/data/gearmesh_train.npy --target-total 2000 \
+  --pos-aug 0.02 --rot-aug-deg 5
+```
+
+**Visualize training data** with fingertip position heatmaps. You can point to either an `.npy` file or a data root directory:
+
+```bash
+# From .npy file
+python scripts/vis/plot_data.py path/to/camera_image.jpg \
+  --npy-path logs/data/gearmesh_train.npy \
+  --out logs/vis/gearmesh_heatmap.png
+
+# From data root directory
+python scripts/vis/plot_data.py path/to/camera_image.jpg \
+  --data-root logs/data/gearmesh_knn_500 \
+  --out logs/vis/gearmesh_heatmap.png
+```
+
+**3. Train DiffusionPolicy:**
+
+```bash
+bash scripts/train_bc.sh <dataset_path> <job_name>
+```
+
+The `dataset_path` can be a HuggingFace dataset ID or a locally collected dataset. Ensure the observation and action spaces are consistent with the target task, as defined in [`source/pilot_models/config/state_dp_cfg.json`](source/pilot_models/config/state_dp_cfg.json).
+
+**Available HF datasets:** Expert — `shashuo0104/0126_gearmesh_expert_2000`, `shashuo0104/0129_peginsert_expert_2000`, `shashuo0104/0129_nutthread_expert_2000`. Augmented Teleop — `shashuo0104/0121_gearmesh_teleop_aug_2000`, `shashuo0104/0121_peginsert_teleop_aug_2000`, `shashuo0104/0121_nutthread_teleop_aug_2000`.
+
+### Adding New Tasks and Models
+
+#### New Assembly Task
+
+1. **Create USD assets** for the held and fixed objects (local paths or uploaded to HuggingFace)
+2. **Define asset configs** in `assembly_tasks_cfg.py` — subclass `HeldAssetCfg` and `FixedAssetCfg`
+3. **Define task config** as `AssemblyTask` subclass — set data paths, rewards, success threshold
+4. **Create env config** in `xarm_env_cfg.py` — subclass `XArmEnvCfg`
+5. **Register** in `__init__.py` with `gym.register()`
+6. **Verify** with `python scripts/list_envs.py`
+
+#### New Pilot Model
+
+1. Implement in `source/pilot_models/` with `get_actions(episode_idx, pos, quat, grip)` (returns an 8D pos+quat+gripper base action) and `clear(env_ids)` methods for retrieval-style pilots (see `knn_pilot.py`), or `act(obs)` / `reset()` for learned policies (see `bc_pilot.py`)
+2. Register in `_init_pilot()` in `xarm_env.py`
+3. Add mapping in `source/utils/constants.py` (`PILOT_NAME_MAP`)
+
+## Three Blocks: SpaceMouse Teleop Workflow
+
+`ThreeBlocks` is a multi-goal block-sorting task (pick up to 3 blocks into a bin) driven live by a physical [SpaceMouse](https://3dconnexion.com/) via `SpaceMousePilot`, rather than pre-recorded teleop/expert `.npy` data. This is the end-to-end loop for collecting demos, converting them to the kNN dataset format, and training a residual copilot on top.
+
+The bin is kinematic (`kinematic_enabled=True` in `ThreeBlocks.fixed_asset`) — a placement target that is never pushed by the arm or by dropped blocks.
+
+**1. Drive the task by hand** (sanity-check the SpaceMouse connection and controls):
+
+```bash
+python scripts/play.py --task ThreeBlocks --pilot SpaceMousePilot --num_envs 1
+```
+
+**2. Record demos:**
+
+```bash
+python scripts/play.py --task ThreeBlocks --pilot SpaceMousePilot --num_envs 1 --record
+```
+
+**3. Append the recording to your dataset** (`convert_demos.py` reads `logs/rollouts/<dir>`, keeps only successful episodes per `meta/stats.json`, and writes/appends to a single `.npy`):
+
+```bash
+python scripts/convert_demos.py \
+  --rollout_dir logs/rollouts/eval_ThreeBlocks_with_SpaceMousePilot \
+  --output logs/data/threeblocks_seq_demos.npy --append
+```
+
+**4. Verify the output loads in kNN format:**
+
+```bash
+python -c "import numpy as np; print('episodes:', len(np.load('logs/data/threeblocks_seq_demos.npy', allow_pickle=True).item()))"
+```
+
+**5. Test the kNN pilot** against the newly appended demos:
+
+```bash
+python scripts/play.py --task ThreeBlocks --pilot kNNPilot --num_envs 1
+```
+
+**6. Train the residual copilot** (long-running — disable auto-suspend first if training on a laptop/workstation):
+
+```bash
+# disable auto-suspend (long run)
+gsettings set org.gnome.settings-daemon.plugins.power sleep-inactive-ac-type 'nothing'
+
+# train
+python scripts/train.py --task XArm-ThreeBlocks-Residual --pilot kNNPilot --num_envs 128 --headless
+```
+
+**7. Run the trained copilot live**, assisting the SpaceMouse pilot:
+
+```bash
+python scripts/play.py \
+  --task ThreeBlocks --pilot SpaceMousePilot --copilot ResidualCopilot --num_envs 1 \
+  --checkpoint logs/rl_games/FactoryXarm/none/nn/last_FactoryXarm_ep_400_rew_-109.26714.pth
+```
+
+**8. Alternative: run a DiSCo guided-diffusion copilot live**, from a BC checkpoint trained on the recorded demos (see [Training Guided Diffusion Copilot](#training-guided-diffusion-copilot) to train one against `threeblocks_seq_demos.npy`):
+
+```bash
+python scripts/play.py \
+  --task ThreeBlocks --pilot SpaceMousePilot --copilot DiSCo --num_envs 1 \
+  --checkpoint outputs/train/threeblocks_expert_50_bc_expert/checkpoints/060000/pretrained_model
+```
+
+## RandomBlock: Randomized Block/Bin Task
+
+> Measured results for every training round — dataset sizes, configs, success rates,
+> failure modes and what they imply — are kept in **[docs/RESULTS.md](docs/RESULTS.md)**.
+> This section is the how-to; that file is the record.
+
+> **On this branch (`two-camera`) the RandomBlock scene is the redesigned one** — bin at
+> the robot's right, square 16 x 16 cm block region (see
+> [Two-Camera Variant](#two-camera-variant-two-camera-branch-only)). The step-by-step
+> walk-through below (steps 1-12, rounds v3-v5, correction rounds 1-3) was written for
+> the original single-camera scene and is kept because the two-camera workflow reuses
+> its commands. Its layout notes, demo counts and results belong to the
+> `single-camera` branch, where the full record lives.
+
+`RandomBlock` is the base task for the VLA shared-autonomy study. It reuses the
+`ThreeBlocks` scene but changes two things:
+
+- **Randomized block positions.** The three block xy positions are resampled
+  uniformly over a rectangle every reset (per-env), so a policy cannot memorize
+  one trajectory and has to localize the blocks from observation.
+- **Single-target, language-conditioned pick.** Each episode names one block
+  colour — `"pick up the {color} block and put it in the bin"` — and the other
+  two are distractors. **Success = the instructed block is in the bin and no
+  distractor is.** The instruction string is on
+  `env.unwrapped.instructions[env_id]`, printed at reset for small runs, and
+  saved into `meta/stats.json` by `--record`.
+
+> **Colour balance is not guaranteed.** The target advances round-robin *within a
+> process*, but `target_block_idx` is seeded randomly at env construction — so
+> when you collect one episode per launch (the normal teleop workflow) the colour
+> is effectively random each time. A 100-demo run came out 41/34/25. Check the
+> balance partway through and keep going if one colour is lagging.
+
+The **bin is not randomized**: it is pinned to a constant pose (`bin_pos`, on this
+branch `(0.37, -0.18, 0.0025)`; `(0.54, 0.0, 0.0025)` on `single-camera`) every episode. The bin geometry is kinematic (inherited
+from `ThreeBlocks.fixed_asset`) so it never moves under gravity or contact.
+
+Registered environments:
+
+| Gym id | Action space | Use |
+|--------|--------------|-----|
+| `XArm-RandomBlock-Residual` | 7D residual | pilot + residual-RL copilot stack (kNN / SpaceMouse / BC) |
+| `XArm-RandomBlock-GuidedDiffusion` | 8D absolute | absolute-action policies (guided diffusion; SmolVLA integration) |
+
+**Randomization knobs** — `RandomBlock` in `source/xarm_assembly_env/assembly_tasks_cfg.py`:
+
+| Field | Default | Meaning |
+|-------|---------|---------|
+| `randomize_positions` | `True` | master switch for block-position randomization |
+| `block_x_range` | `(0.29, 0.45)` | x-range each block is sampled from |
+| `block_y_range` | `(-0.06, 0.10)` | y-range each block is sampled from |
+| `block_min_separation` | `0.06` | min centre-to-centre distance between blocks (rejection-resampled) |
+| `bin_clearance` | `0.12` | min distance a block may spawn from the bin centre |
+| `start_clearance` | `0.05` | min xy distance a block may spawn from the gripper's start pose |
+| `block_spawn_z` | `0.012` | block spawn height — the resting centre height of a 3 cm cube, so blocks spawn at rest rather than dropping |
+| `bin_pos` | `(0.37, -0.18, 0.0025)` | fixed bin pose — never resampled; the bin is kinematic |
+| `start_eef_xy` | `(0.36, 0.0)` | starting fingertip xy (over the block region) |
+| `start_eef_z` | `0.18` | starting fingertip height above the table (arm starts fairly upright) |
+| `single_target` | `True` | one instructed block per episode; the rest are distractors |
+| `target_colors` | `("red", "green", "blue")` | colour name per block index (A/B/C) |
+| `allowed_target_idx` | `(0, 1, 2)` | which colours episodes may target — restrict (e.g. `(0, 1)`) to hold a colour out for the challenge eval set |
+| `instruction_template` | `"pick up the {color} block and put it in the bin"` | instruction string format |
+
+Block sampling happens in `XArmEnv._sample_block_layout()` (uniform over the
+rectangle, rejection-resampled for separation, bin clearance and start clearance). To build the
+"challenging task" held-out variation, subclass `RandomBlock` with disjoint (or
+wider) ranges and register a new cfg the same way `XArmRandomBlockCfg` is
+registered.
+
+**1. Drive the task by hand** (visual sanity-check that the blocks land in new
+positions each episode):
+
+```bash
+python scripts/play.py --task RandomBlock --pilot SpaceMousePilot --num_envs 1
+```
+
+> Block positions resample on every reset (and per-env), but the RNG is seeded.
+> `play.py` now draws a fresh random seed each run and prints it — pass
+> `--seed <int>` to reproduce a specific layout. With a fixed seed, episode 0 is
+> identical every run; let the run continue past the first episode to see the
+> positions change.
+
+**2. Record demos.** `--record` enables the front camera and writes RGB frames +
+robot state per timestep, plus the per-episode instruction into `meta/stats.json`.
+The episode ends on success.
+
+```bash
+python scripts/play.py --task RandomBlock --pilot SpaceMousePilot --num_envs 1 --record
+```
+
+> **One episode per launch.** With `--num_envs 1` the recorder stops once that
+> env's episode ends, so collecting N demos means N launches (steps 2+3 repeated).
+>
+> **Two instructions get printed — drive the first.** The second is printed by the
+> auto-reset that fires as the episode ends, and belongs to an episode you never
+> drive. The saved label is taken from the correct one either way.
+>
+> Set `SM_DEBUG=1` to re-enable the per-step SpaceMouse axis readout (off by
+> default — at 15 Hz it prints ~1400 lines per episode and scrolls the instruction
+> off screen).
+
+> **`OSError: open failed` from `spacemouse_pilot.py`** means the HID device could
+> not be opened. In order of likelihood: the SpaceMouse is unplugged (`lsusb -d 256f:`
+> should list it — the pilot opens vendor `0x256f`, product `0xc635`); a crashed
+> earlier run still holds it, since the device is exclusive-open (`pgrep -af play.py`,
+> then kill it); or the hidraw node is root-only (`ls -l /dev/hidraw*` should show
+> `crw-rw-rw-` for the SpaceMouse — `/etc/udev/rules.d/99-spacemouse.rules` grants
+> this via `SUBSYSTEM=="hidraw", ATTRS{idVendor}=="256f", MODE="0666"`).
+
+**2b. Controlling *what* gets collected.** Because the target colour is drawn
+independently every launch, the dataset's colour balance is left to chance and
+drifts — the first 100 demos came out 46 green / 33 blue / 21 red, and eval
+success tracked that ordering. Two flags make a batch deliberate:
+
+```bash
+# top up an under-represented colour
+python scripts/play.py --task RandomBlock --pilot SpaceMousePilot --num_envs 1 --record \
+  --target_color red
+
+# same scene, different instruction: re-record one layout under each colour
+python scripts/play.py --task RandomBlock --pilot SpaceMousePilot --num_envs 1 --record \
+  --layout_seed 7 --target_color red
+python scripts/play.py --task RandomBlock --pilot SpaceMousePilot --num_envs 1 --record \
+  --layout_seed 7 --target_color green
+python scripts/play.py --task RandomBlock --pilot SpaceMousePilot --num_envs 1 --record \
+  --layout_seed 7 --target_color blue
+```
+
+`--layout_seed` pins the block layout for the whole run (the sampler is re-seeded
+with it on every reset), so the three commands above differ *only* in the
+instruction. That matters: with every layout seen exactly once, the layout alone
+predicts the demonstrated trajectory and the instruction is redundant — the
+policy can score well on training data without ever reading it. Repeating a
+layout across colours removes that shortcut.
+
+**2c. Batch collection.** Run this **once** — it performs all 150
+record-and-convert cycles itself (50 layouts x 3 colours), taking the dataset from
+100 to **250 demos**. Your only job is to drive each episode with the SpaceMouse as
+it appears; when the episode ends the process exits and the next one launches
+automatically.
+
+```bash
+cd ~/vla-shared-autonomy
+scripts/collect_randomblock.sh 1 50
+```
+
+What the script handles, so a long session can't silently go wrong:
+
+- **Failed demos are re-recorded.** A missed grasp times out after 60 s and is
+  dropped by `convert_demos.py`. The script checks the dataset actually grew and,
+  if not, records the same layout/colour again — so no layout ends up missing a
+  colour. After 3 misses in a row it asks: retry, skip, or quit.
+- **Ctrl-C stops cleanly** after the current step and prints the exact resume
+  command, e.g. `scripts/collect_randomblock.sh 12 50 blue`. It never closes your
+  terminal (a pasted `for` loop with `exit` in it does).
+- **The dataset save cannot be interrupted.** `convert_demos.py` writes the `.npy`
+  and its `.tasks.json` sidecar to temp files and swaps both in with Ctrl-C ignored.
+  A half-written save would truncate the dataset or leave the sidecar out of step
+  with it, which silently mislabels every later episode's instruction.
+- **Pre-flight and backup.** It refuses to start if the SpaceMouse is unplugged or
+  another `play.py` holds it, and copies the `.npy` + sidecar into
+  `logs/data/backups/<timestamp>/` before recording anything.
+- **It doesn't depend on `play.py`'s exit code**, only on whether the demo was saved.
+
+Budget ~4.5–5 h for 150 demos: Isaac restarts on every episode (~40–60 s), which
+is unavoidable with one-episode-per-launch. To split it across sittings:
+
+| Sitting | Command | New demos |
+|---|---|---|
+| 1 | `scripts/collect_randomblock.sh 1 17` | 51 |
+| 2 | `scripts/collect_randomblock.sh 18 34` | 51 |
+| 3 | `scripts/collect_randomblock.sh 35 50` | 48 |
+
+Each sitting appends to the same dataset. Do not reuse a range: the same
+`layout_seed` reproduces the same scene. If you stop early, use the resume command
+the script prints. With the first 100 demos at 46 green / 33 blue / 21 red, the full
+batch ends at 96 / 83 / 71.
+
+> **This does not narrow where blocks spawn.** Within one layout the three
+> episodes target three *different* blocks, so 50 layouts x 3 colours yields 150
+> distinct reach targets — as many as 150 fully random demos. Binned 5x5 over the
+> spawn rectangle, seeds 1–50 leave no empty cell (x 0.300–0.438, y -0.148–0.149).
+> What repeats is the *scene*, which is the point: the same image now maps to three
+> different trajectories, so only the instruction can resolve them.
+
+Check progress at any time from another terminal:
+
+```bash
+python3 -c "
+import json,collections
+m=json.load(open('logs/data/randomblock_demos.npy.tasks.json'))
+c=collections.Counter(v['task'].split()[3] for v in m.values())
+lay=set(tuple(round(x,3) for b in v['block_xy'] for x in b) for v in m.values())
+print('episodes:',len(m),' colours:',dict(c),' unique layouts:',len(lay))
+"
+```
+
+**3. Append the recording to a dataset:**
+
+```bash
+python scripts/convert_demos.py \
+  --rollout_dir logs/rollouts/eval_RandomBlock_with_SpaceMousePilot \
+  --output logs/data/randomblock_demos.npy --append
+```
+
+Answer `y` to the overwrite prompt on the next `--record` run — that demo is
+already in the `.npy`, and the rollout dir is only a staging area. Re-running the
+conversion on an unchanged rollout dir is detected by trajectory fingerprint and
+skipped, so a stray repeat won't duplicate an episode.
+
+This writes three things:
+
+- `randomblock_demos.npy` — the kNN-format trajectories. Actions are clamped to
+  the executable workspace, and the terminal timestep is dropped (on the step
+  that reports `done` the env has already reset, so that sample belongs to the
+  next episode).
+- `randomblock_demos_frames/episode_NNNNN/` — the RGB frames, **copied** out of
+  the rollout dir. This matters: `play.py --record` wipes and reuses the same
+  rollout directory every run, so anything that merely pointed at it would go
+  stale as soon as the next demo was recorded.
+- `randomblock_demos.npy.tasks.json` — a sidecar holding each episode's `task`
+  string, `frames` path, `steps` / `n_frames`, `block_xy`, `target_idx` and a
+  trajectory `fingerprint` (re-running the conversion on an already-converted
+  recording is skipped rather than duplicated). It is kept out of the `.npy`
+  because the kNN loader tensorizes every key in an episode dict.
+
+**4. Verify the collection.** Do this after the first ~3 demos (to confirm the
+pipeline) and again before training. It checks the failure modes that are
+otherwise silent:
+
+```bash
+python - <<'PY'
+import numpy as np, json, collections, os
+d = np.load('logs/data/randomblock_demos.npy', allow_pickle=True).item()
+m = json.load(open('logs/data/randomblock_demos.npy.tasks.json'))
+print(f"episodes {len(d)} / meta {len(m)}")
+print("colours :", dict(collections.Counter(v['task'].split()[3] for v in m.values())))
+bad = collections.defaultdict(list)
+seen = {}
+for k in sorted(d):
+    e, n = m[str(k)], len(d[k]['obs.gripper'])
+    if e.get('steps') != n or e.get('n_frames') != n: bad['count'].append(k)
+    fd = e.get('frames')
+    if not fd or not os.path.isdir(fd): bad['no_frames'].append(k)
+    elif len([f for f in os.listdir(fd) if f.endswith(('.jpg', '.png'))]) != n: bad['count'].append(k)
+    p = d[k]['obs.fingertip_pos'][-1]           # must NOT be the reset start pose
+    if abs(p[0] - 0.36) < 1e-3 and abs(p[1]) < 1e-3 and abs(p[2] - 0.18) < 1e-3: bad['terminal'].append(k)
+    if e.get('fingerprint') in seen: bad['dup'].append(k)
+    seen[e.get('fingerprint')] = k
+print({k: v for k, v in bad.items()} or "all checks pass")
+ag = np.concatenate([d[k]['action.gripper'] for k in sorted(d)])
+ap = np.concatenate([d[k]['action.fingertip_pos'] for k in sorted(d)])
+print(f"action.grip [{ag.min()}, {ag.max()}] (want [0,1]);  pos z floor {ap[:,2].min():.3f} (want 0.000)")
+PY
+```
+
+Also confirm each episode's `task` matches the colour you actually drove — that
+is the one check no script can make for you, and it is the check that catches a
+label desync.
+
+**5. Build the SmolVLA dataset** (images + per-episode `task` string):
+
+```bash
+python scripts/npy_to_lerobot.py \
+  --input logs/data/randomblock_demos.npy \
+  --repo_id local/randomblock_vla_250 \
+  --root logs/lerobot/randomblock_vla_250 \
+  --images --overwrite
+```
+
+Give each dataset build its own `--repo_id` / `--root` (here `_250` for the 250-demo
+set) rather than overwriting the previous one, so older checkpoints stay reproducible.
+Sanity-check the result: `logs/lerobot/randomblock_vla_250/meta/info.json` should
+report `total_episodes: 250`.
+
+`--images` reads the sidecar, attaches `observation.images.front` from the copied
+frames, and uses the per-episode instruction as the `task` (it also drops
+`observation.environment_state` — the VLA grounds spatial relations from pixels +
+language). Drop `--images` (and pass `--task "..."`) for a state-only
+DiffusionPolicy dataset.
+
+- `--root <dir>` keeps the dataset local; omit it to use the HF cache, add
+  `--push_to_hub` (with a real `<hf_user>/…` repo id) to upload.
+- **`--overwrite`** deletes `--root` first. `LeRobotDataset.create()` refuses to
+  write into an existing directory, so without it any failed run blocks every
+  retry with `FileExistsError`.
+- `--image_dtype video` (default) needs ffmpeg; use `--image_dtype image` to
+  store PNGs instead — larger on disk, trains the same.
+
+Sizing: the SmolVLA paper found ~50 demos per variation enough and 25 not. On this
+task **100 demos was not enough** — with blocks, distractors and target all
+randomized, the model scored 0/20. The 250-demo set (100 random layouts + 50
+layouts x 3 colours from step 2c) reached 11/20. See the results table in step 7.
+
+**6. Finetune SmolVLA** on that dataset (LeRobot's built-in trainer, no custom script):
+
+```bash
+# keep the machine awake for a multi-hour run
+gsettings set org.gnome.settings-daemon.plugins.power sleep-inactive-ac-type 'nothing'
+
+lerobot-train \
+  --policy.path=lerobot/smolvla_base \
+  --policy.push_to_hub=false \
+  --dataset.repo_id=local/randomblock_vla_250 \
+  --dataset.root=logs/lerobot/randomblock_vla_250 \
+  --dataset.video_backend=pyav \
+  --dataset.image_transforms.enable=true \
+  --dataset.image_transforms.tfs='{"brightness":{"weight":1.0,"type":"ColorJitter","kwargs":{"brightness":[0.8,1.2]}},"contrast":{"weight":1.0,"type":"ColorJitter","kwargs":{"contrast":[0.8,1.2]}},"saturation":{"weight":1.0,"type":"ColorJitter","kwargs":{"saturation":[0.6,1.4]}},"hue":{"weight":1.0,"type":"ColorJitter","kwargs":{"hue":[-0.04,0.04]}},"sharpness":{"weight":1.0,"type":"SharpnessJitter","kwargs":{"sharpness":[0.6,1.4]}}}' \
+  --rename_map='{"observation.images.front": "observation.images.camera1"}' \
+  --batch_size=64 --steps=30000 --save_freq=2500 \
+  --output_dir=outputs/train/rb_smolvla_v4 --job_name=rb_smolvla_v4 \
+  --policy.device=cuda 2>&1 | tee /tmp/train_v4.log
+```
+
+This is the exact configuration that produced `rb_smolvla_v4` (and, apart from the
+dataset and step count, `rb_smolvla_v3`).
+
+- **`--dataset.image_transforms.*`** turns on photometric augmentation (brightness,
+  contrast, saturation, small hue shift, sharpness). LeRobot's default transform set
+  also includes a random affine; it is deliberately left out because shifting the
+  image moves the blocks relative to the arm, which corrupts the very positions the
+  policy must reach. The CLI only accepts `tfs` as a whole JSON dict —
+  `--dataset.image_transforms.tfs.affine.weight=0` is rejected.
+- **`--steps=30000`** scales with data: v3's best checkpoint was ~67 epochs over 100
+  demos, and the same epoch count over 250 demos (24k frames) is ~25k steps.
+- **`--save_freq=2500`** keeps intermediate checkpoints. The last one is not
+  necessarily the best (v3 peaked at 10k of 20k), so step 7 sweeps several.
+- **`--output_dir` must not exist** unless resuming; `lerobot-train` refuses to write
+  into an existing run.
+- Each checkpoint is ~1.1 GB; 12 checkpoints need ~13 GB free.
+
+- **`--rename_map`** is required. `smolvla_base` declares three cameras
+  (`camera1/2/3`); our dataset has one (`front`). Validation passes when the
+  dataset's visual keys are a *subset* of the policy's, so mapping `front →
+  camera1` is enough — SmolVLA then trains on that single camera and ignores the
+  other two (missing keys are only zero-padded up to `config.empty_cameras`,
+  which is `0`). Without it: `Feature mismatch between dataset/environment and
+  policy config`.
+  → The finetuned checkpoint therefore expects **`observation.images.camera1`** at
+  inference. `eval_smolvla.py` reads the key off the checkpoint config
+  automatically, so this needs no extra flag at eval time.
+- **`--dataset.video_backend=pyav`** avoids `torchcodec`, whose default decoder
+  links FFmpeg's shared libraries (`libavutil.so.*`) — those are usually absent
+  even when the `ffmpeg` *binary* is present, so dataset encoding succeeds and
+  then training dies at the first batch with
+  `RuntimeError: Could not load libtorchcodec`. `pyav` ships its own FFmpeg.
+  (The other way out is rebuilding the dataset with `--image_dtype image`, which
+  skips video decoding entirely at the cost of disk.)
+- **`--policy.push_to_hub=false`** is required for local training — it defaults to
+  true, and the config validator then rejects the run with
+  `'policy.repo_id' argument missing`. To push instead, pass
+  `--policy.repo_id=<hf_user>/rb_smolvla`.
+- Drop `--dataset.root` if the dataset was pushed to the Hub.
+- Lower `--batch_size` (e.g. 32) if it OOMs.
+- SmolVLA's SmolVLM processor needs a package that isn't pulled in by default:
+  `uv pip install num2words` (otherwise it fails with
+  `ImportError: Package num2words is required to run SmolVLM processor`).
+
+Measured speed on this workstation: ~0.65 s/step, so 20k steps ≈ 3.5 h and 30k ≈
+5.5 h. The log line shows where the time goes — `data_s` (video decode) exceeds
+`updt_s` (GPU), so the GPU is mostly waiting. Adding `--num_workers=12` (default 4;
+the machine has 20 cores) should shorten it without changing the result.
+Checkpoints land in `outputs/train/rb_smolvla_v4/checkpoints/`.
+
+**7. Evaluate** — N fresh episodes, no human, SmolVLA driving:
+
+```bash
+python scripts/eval_smolvla.py \
+  --checkpoint outputs/train/rb_smolvla_v4/checkpoints/025000/pretrained_model \
+  --num_episodes 30 --n_action_steps 5 --max_steps 150 --debug_grounding
+```
+
+Feeds the front-camera RGB + 14D state + instruction to SmolVLA each step, runs
+its 8D absolute action through `XArm-RandomBlock-GuidedDiffusion`, and prints a
+summary: overall and per-colour success, failure modes, closest fingertip approach,
+and a target-vs-aimed confusion matrix. Layouts are fresh random ones, not the
+training scenes. Opens the sim window; add `--headless` to run without it.
+
+- **`--n_action_steps 5`** matters most. SmolVLA predicts 50 steps per call and by
+  default executes all of them before looking again — 3.3 s blind, more than half an
+  episode, so it cannot correct a grasp that is drifting off. Re-planning every 5
+  steps needs no retraining.
+- **`--max_steps 150`** (10 s) ends a stuck episode instead of waiting out the env's
+  60 s timeout. Successful demos average ~96 steps.
+- **`--debug_grounding`** records which block the first predicted chunk aims at, for
+  the confusion matrix. A strong diagonal means the instruction is being followed.
+- **`--seed N`** fixes the episode sequence. Use the same seed for every checkpoint
+  you compare; omit it for new random layouts each run.
+
+**Pick the checkpoint by sweeping**, all on the same episodes:
+
+```bash
+for ck in v3/010000 v4/015000 v4/020000 v4/025000 v4/030000; do
+  run=${ck%%/*}; step=${ck##*/}
+  python scripts/eval_smolvla.py \
+    --checkpoint outputs/train/rb_smolvla_$run/checkpoints/$step/pretrained_model \
+    --num_episodes 20 --seed 123 --debug_grounding --max_steps 150 --n_action_steps 5 \
+    --headless 2>&1 | tee /tmp/eval_${run}_${step}.log
+done
+```
+
+Measured results for every round — success rates, per-colour splits, failure modes,
+grounding and what they imply — live in **[docs/RESULTS.md](docs/RESULTS.md)**, so
+they stay in one place as rounds accumulate. In short: 100 demos scored 0/20, 250
+scored 11/20, and 400 scored 10–11/20 (no further gain). Block choice is solved
+(90–95% grounding, no distractor ever binned); every remaining failure is "never
+lifted the target", i.e. the grasp — which is the partial competence the
+shared-autonomy correction study builds on.
+
+> The "closest approach" figures are slightly unreliable for *successful* episodes:
+> the env auto-resets inside the step that ends an episode, so that final reading
+> compares the reset fingertip against the next episode's blocks. Success rates,
+> failure modes and grounding are unaffected.
+
+**8. Second round: 400 demos → v5.** Same pipeline as steps 2c–7, with these
+changes:
+
+```bash
+# collect 150 more on NEW layouts (1-50 are already recorded)
+scripts/collect_randomblock.sh 51 100
+
+# build a separate dataset
+python scripts/npy_to_lerobot.py \
+  --input logs/data/randomblock_demos.npy \
+  --repo_id local/randomblock_vla_400 \
+  --root logs/lerobot/randomblock_vla_400 \
+  --images --overwrite
+```
+
+Train with the step 6 command, changing only these arguments:
+
+```bash
+  --dataset.repo_id=local/randomblock_vla_400 \
+  --dataset.root=logs/lerobot/randomblock_vla_400 \
+  --batch_size=64 --steps=40000 --save_freq=5000 --num_workers=12 \
+  --output_dir=outputs/train/rb_smolvla_v5 --job_name=rb_smolvla_v5 \
+  --policy.device=cuda 2>&1 | tee /tmp/train_v5.log
+```
+
+- **`--steps=40000`** keeps the same amount of training per demo: v4 peaked at ~66
+  epochs, which over 400 demos (37k frames) is ~40k steps.
+- **`--save_freq=5000`** halves the checkpoint count (8 x ~1.3 GB) to fit on disk.
+- **`--num_workers=12`** speeds up data loading only; it does not change the result.
+
+When training prints `End of training`, **watch the model** — opens the sim window,
+new random layouts every run, Ctrl-C to stop:
+
+```bash
+python scripts/eval_smolvla.py \
+  --checkpoint outputs/train/rb_smolvla_v5/checkpoints/040000/pretrained_model \
+  --num_episodes 5 --n_action_steps 5 --max_steps 150
+```
+
+Keep `--n_action_steps 5` even just to watch: without it the robot executes 50 steps
+before looking again and misses far more than it really would.
+
+Then **score it** against v4, one checkpoint at a time:
+
+```bash
+python scripts/eval_smolvla.py \
+  --checkpoint outputs/train/rb_smolvla_v5/checkpoints/040000/pretrained_model \
+  --num_episodes 20 --seed 123 --n_action_steps 5 --max_steps 150 --debug_grounding
+```
+
+Keep **`--num_episodes 20 --seed 123`**: those are the episodes in the step 7
+results table, so the score is directly comparable to v4 @ 25k's 11/20. Then swap
+`040000` for `020000`, `025000`, `030000` or `035000` — the final checkpoint is not
+necessarily the best. To run them all unattended instead, use the step 7 sweep loop
+with `for ck in v4/025000 v5/020000 v5/025000 v5/030000 v5/035000 v5/040000`.
+
+**9. Shared autonomy: record human corrections.** The study's core step. SmolVLA and
+the SpaceMouse both act on the *same* observation each timestep; the robot executes
+the blend, and all three actions are logged:
+
+```
+a_R    = SmolVLA (the base policy from step 7/8)
+a_H    = you, on the SpaceMouse
+a_exec = alpha * a_R + (1 - alpha) * a_H      <- what actually runs
+```
+
+```bash
+python scripts/shared_autonomy.py \
+  --checkpoint outputs/train/rb_smolvla_v5/checkpoints/025000/pretrained_model \
+  --num_episodes 5 --alpha 0.5
+```
+
+Unlike `play.py`, this runs **several episodes per launch** — no 60 s Isaac restart
+between them. Recording is on by default (`logs/rollouts/shared_autonomy_<task>/`,
+`--no_record` to drive without saving).
+
+- **`--alpha`** (0.5): weight on the *robot*. 1.0 = robot only, 0.0 = human only.
+- **Idle gating (default).** An untouched SpaceMouse reports zero, so blending it in
+  unconditionally would drag the arm toward standing still and fill the log with
+  `a_H = hold` samples that are not corrections. While you are not touching it the
+  robot runs on `a_R` alone; blending starts the moment you push. `--blend_always`
+  disables this.
+- **Gripper** does not average meaningfully, so open/close follows whoever is in
+  charge: you for `--grip_hold_steps` (30) after a button press, the policy otherwise.
+  Both raw values are logged either way.
+- **`--n_action_steps 5`** matches the evaluation protocol; the checkpoint's own
+  default (50) is 3.3 s open-loop and cannot react to a correction.
+- Both actions are computed from `o_t` *before* the step, so `(o_t, a_H, a_R, a_exec)`
+  carries no one-step lag.
+
+Per episode it prints how many steps you intervened on and the median / p90 of
+`d_t = ||a_H - a_R||` — that distribution is how the disagreement threshold `tau`
+gets chosen, once real data exists.
+
+**Build both comparison datasets from the same recording** — identical observations,
+differing only on the selected corrective steps:
+
+```bash
+# repeat per session dir; --append merges them
+for M in human blend; do
+  python scripts/convert_demos.py --rollout_dir logs/rollouts/shared_autonomy_s2 \
+    --output logs/data/corrections_$M.npy --append --action_prefix $M --angle_threshold 0
+done
+
+python scripts/npy_to_lerobot.py --input logs/data/corrections_human.npy \
+  --repo_id local/corrections_human --root logs/lerobot/corrections_human --images --overwrite
+```
+
+`--action_prefix human` / `blend` label a step with `a_H` / `a_exec` when it is
+corrective (human intervening, direction disagreement >= `--angle_threshold`) and with
+the *policy's own action* otherwise — the same fallback in both, so the two datasets
+differ by exactly the label under test. Two details this protects against:
+
+- Taking `base_action` wholesale would train on "hold this pose" for the ~80% of steps
+  the human never touched the SpaceMouse — i.e. teach the policy to stop moving.
+- Taking `exec_action` wholesale would leave D_blend differing from D_human on
+  interventions the threshold excluded, confounding the comparison at any `tau > 0`.
+
+Measured on the first 50-episode session: 4,144 steps, 721 corrective (17%),
+correction bursts of median 3 steps clustered in the approach phase, direction
+disagreement median 69 deg. `tau` = 0 / 45 / 90 deg selects 721 / 498 / 218 steps.
+
+**10. Finetune both and compare.** Two runs from the *same* base checkpoint, identical
+in every argument except the dataset and the output dir:
+
+```bash
+for M in human blend; do
+  lerobot-train \
+    --policy.path=outputs/train/rb_smolvla_v5/checkpoints/025000/pretrained_model \
+    --policy.push_to_hub=false \
+    --dataset.repo_id=local/corrections_$M \
+    --dataset.root=logs/lerobot/corrections_$M \
+    --dataset.video_backend=pyav \
+    --rename_map='{"observation.images.front": "observation.images.camera1"}' \
+    --batch_size=64 --steps=3000 --save_freq=1000 --num_workers=12 --seed=1000 \
+    --policy.optimizer_lr=2.5e-5 \
+    --output_dir=outputs/train/ft_$M --job_name=ft_$M \
+    --policy.device=cuda 2>&1 | tee /tmp/train_ft_$M.log
+done
+```
+
+- **`--seed=1000` on both** fixes initialization and data order, so the only difference
+  between the runs is the 711 labels. Without it, part of any gap would be run-to-run
+  noise.
+- **`--policy.optimizer_lr=2.5e-5`** (vs 1e-4 for base training): this finetunes an
+  already-competent policy on ~4k frames.
+- **Corrections only, no base demos mixed in.** Mixing would guard against forgetting,
+  but it dilutes the differing labels to ~2% of the data and any effect disappears.
+  The base policy is evaluated alongside, so degradation is visible if it happens.
+- Run them sequentially — two at once contend for the GPU. ~30-40 min each.
+
+Then evaluate both plus the untouched base on the **same** episodes:
+
+```bash
+for ck in rb_smolvla_v5/025000 ft_human/003000 ft_blend/003000; do
+  run=${ck%%/*}; step=${ck##*/}
+  python scripts/eval_smolvla.py \
+    --checkpoint outputs/train/$run/checkpoints/$step/pretrained_model \
+    --num_episodes 50 --seed 123 --debug_grounding --max_steps 150 --n_action_steps 5 \
+    --headless 2>&1 | tee /tmp/eval_${run}_${step}.log
+done
+```
+
+To *watch* the three instead, drop `--headless` and run a few episodes each:
+
+```bash
+cd ~/vla-shared-autonomy
+
+# base policy (what the finetunes started from)
+python scripts/eval_smolvla.py \
+  --checkpoint outputs/train/rb_smolvla_v5/checkpoints/025000/pretrained_model \
+  --num_episodes 5 --n_action_steps 5 --max_steps 150
+
+# trained on the raw human corrections
+python scripts/eval_smolvla.py \
+  --checkpoint outputs/train/ft_human/checkpoints/003000/pretrained_model \
+  --num_episodes 5 --n_action_steps 5 --max_steps 150
+
+# trained on the blended executed actions
+python scripts/eval_smolvla.py \
+  --checkpoint outputs/train/ft_blend/checkpoints/003000/pretrained_model \
+  --num_episodes 5 --n_action_steps 5 --max_steps 150
+```
+
+As written, each run draws fresh random layouts. Add the same `--seed N` to all three
+to put them on identical scenes — necessary if you want to compare them by eye rather
+than just check that each one behaves sanely.
+
+Pass the **same `--seed`** to every model so they face identical layouts — without it
+each run draws new scenes and watching them tells you nothing comparative. Omit
+`--seed` entirely for fresh random layouts. Five episodes shows whether a model looks
+sane or broken; it cannot rank them.
+
+The policy drives alone here — no SpaceMouse, no blending. Use **50 episodes**: at 20
+the standard error is ~11%, enough to hide any moderate effect; 50 brings it to ~7%.
+Compare both finetunes at the *same* step rather than each one's best checkpoint,
+which would bias the comparison toward whichever got luckier.
+
+Outcomes: `ft_human` > `ft_blend` supports the study's hypothesis that raw human
+corrections are the stronger signal; the reverse favours the executed blend; both above
+base but tied means corrections help and the label choice does not; both at base means
+721 corrective samples was too few to move a 450M policy.
+
+> Not yet exercised against Isaac hardware-in-the-loop. The blend math and the
+> two-dataset conversion are unit-tested; the env/SpaceMouse path is not. Do one
+> `--num_episodes 1` run first and check that `d_t` moves when you push the mouse.
+
+**11. Round 3: vary alpha, and scale the corrective share.** Rounds 1-2 were null on
+the label question (see [docs/RESULTS.md](docs/RESULTS.md)), so round 3 changes what
+governs *effect size* rather than sample size: a higher alpha widens the gap between
+`a_H` and `a_exec`, and more correction episodes raise the fraction of training data
+whose labels differ.
+
+```bash
+# 1. collect per alpha, ten sessions of ten (sa08_s1..s10 at 0.8, sa05b_s1..s10 at 0.5)
+python scripts/shared_autonomy.py \
+  --checkpoint outputs/train/rb_smolvla_v5/checkpoints/025000/pretrained_model \
+  --num_episodes 10 --alpha 0.8 --rollout_dir logs/rollouts/sa08_s1
+
+# 2. per arm: convert every session, then add the SAME seeded base-demo slice
+for M in human blend; do
+  for i in $(seq 1 10); do
+    python scripts/convert_demos.py --rollout_dir logs/rollouts/sa08_s$i \
+      --output logs/data/corr08_$M.npy --append --action_prefix $M --angle_threshold 0
+  done
+  python scripts/merge_npy_datasets.py \
+    --inputs logs/data/corr08_$M.npy logs/data/randomblock_demos.npy \
+    --take all 100 --seed 0 --output logs/data/mix08_$M.npy
+  python scripts/npy_to_lerobot.py --input logs/data/mix08_$M.npy \
+    --repo_id local/mix08_$M --root logs/lerobot/mix08_$M --images --overwrite
+done
+
+# 3. train both arms (step 10 command, --steps 6500 for the larger set), then evaluate
+for M in mix08_human mix08_blend mix05b_human mix05b_blend; do
+  python scripts/eval_smolvla.py \
+    --checkpoint outputs/train/$M/checkpoints/006500/pretrained_model \
+    --num_episodes 200 --seed 123 --debug_grounding --max_steps 150 --n_action_steps 5 \
+    --headless 2>&1 | tee /tmp/eval200_${M}_006500.log
+done
+```
+
+- **`--take all 100 --seed 0`** must be identical for every arm, or the arms differ by
+  their base-demo slice as well as by the labels under test.
+- **Wait for `npy_to_lerobot` to finish before training.** It writes episodes
+  incrementally; starting early trains on a partial dataset with no error at all.
+  Check `meta/info.json` reports the expected `total_episodes`.
+- **`--steps`** scales with dataset size to hold epochs roughly constant (5,000 for
+  13k frames, 6,500 for 17.5k).
+- Measured contrast: alpha 0.8 gave 11.7% of training steps differing with a 10.9 cm
+  median label gap; alpha 0.5 gave 4.8% and 6.2 cm. Raising alpha is the lever that
+  makes the two labels genuinely different targets.
+
+**12. Control arm: ballast without corrections.** Every finetuned arm trains on 100
+correction episodes *plus* 100 of the 400 base demos, so "arm vs base policy" confounds
+two changes: the corrections, and finetuning on a quarter of the original data. This
+control removes the corrections and keeps everything else, making the comparison clean.
+
+```bash
+# the SAME seeded 100-demo slice the arms used, with no corrections
+python scripts/merge_npy_datasets.py --inputs logs/data/randomblock_demos.npy \
+  --take 100 --seed 0 --output logs/data/ballast_only.npy
+python scripts/npy_to_lerobot.py --input logs/data/ballast_only.npy \
+  --repo_id local/ballast_only --root logs/lerobot/ballast_only --images --overwrite
+
+lerobot-train \
+  --policy.path=outputs/train/rb_smolvla_v5/checkpoints/025000/pretrained_model \
+  --policy.push_to_hub=false \
+  --dataset.repo_id=local/ballast_only --dataset.root=logs/lerobot/ballast_only \
+  --dataset.video_backend=pyav \
+  --rename_map='{"observation.images.front": "observation.images.camera1"}' \
+  --batch_size=64 --steps=3400 --save_freq=1700 --num_workers=12 --seed=1000 \
+  --policy.optimizer_lr=2.5e-5 \
+  --output_dir=outputs/train/ballast_only --job_name=ballast_only \
+  --policy.device=cuda 2>&1 | tee /tmp/train_ballast_only.log
+
+python scripts/eval_smolvla.py \
+  --checkpoint outputs/train/ballast_only/checkpoints/003400/pretrained_model \
+  --num_episodes 200 --seed 123 --debug_grounding --max_steps 150 --n_action_steps 5 \
+  --headless 2>&1 | tee /tmp/eval200_ballast_only_003400.log
+```
+
+- **`--steps=3400`, not 6,500.** The mixed arms ran 6,500 steps over 17,590 frames
+  (~23.6 epochs), so each base demo was seen ~23.6 times. 3,400 steps over 9,179 frames
+  reproduces that exposure. Matching the *step count* instead would show the base demos
+  about twice as often, and any difference would read as "trained harder on demos"
+  rather than "no corrections".
+- **`--take 100 --seed 0`** reproduces the arms' slice exactly; `merge_npy_datasets.py`
+  records `merged_from` / `merged_episode` per episode, so the slice stays auditable.
+
+---
+
+*Not the VLA path:* `python scripts/train.py --task XArm-RandomBlock-Residual --pilot kNNPilot --num_envs 128 --headless`
+trains the original state-based residual-RL copilot. Unrelated to the SmolVLA
+study — kept only for the residual-copilot framework.
+
+## Two-Camera Variant (`two-camera` branch only)
+
+> **Branches.** `two-camera` (the default) holds this variant and every result through
+> [docs/RESULTS.md](docs/RESULTS.md) section 17. `single-camera` holds the original
+> one-camera scene and its results (sections 1-13). They were previously named
+> `wrist-camera` and `main`.
+
+A redesign of the RandomBlock scene around **two cameras** — one on the gripper, one
+square-on from the side — replacing the single calibrated front camera. It exists to
+attack the failure mode the single-camera study could not fix: every v4/v5 model
+reached the right block and then missed the grasp (see
+[docs/RESULTS.md](docs/RESULTS.md)).
+
+> **Data and checkpoints do not cross between this branch and `single-camera`.** The
+> observation space and the scene both differ. A two-camera checkpoint cannot run in a
+> one-camera env, and the 650 single-camera recordings cannot gain a second view
+> retroactively — only rendered frames were saved, not simulator state.
+
+### What changed
+
+| | `main` | here |
+|---|---|---|
+| Cameras | front, 848x480, 33 deg down, calibrated to the real D435 | **wrist** 320x240 on the gripper front + **side** 480x360, square-on, 44 deg down |
+| Bin | (0.54, 0) straight ahead, 0.54 m reach | **(0.37, -0.18)**, the robot's right, 0.41 m reach |
+| Block region | x 0.30-0.44, y -0.15..0.15 (14 x 30 cm) | **x 0.29-0.45, y -0.06..0.10** (16 x 16 cm, square) |
+| Spawn rejection | bin 0.11 m | bin 0.12 m + **start pose 0.05 m** |
+
+The bin's x matches the block region's centre x (0.37), so bin and blocks lie on one
+line — the line the side camera looks along. The start-pose rejection stops an episode
+beginning with a block under the fingers.
+
+### Check the views before collecting
+
+```bash
+python scripts/eval_smolvla.py --dump_only \
+  --dump_wrist logs/views/wrist.png --dump_upper_right logs/views/side.png
+xdg-open logs/views/wrist.png
+```
+
+`--ur_pos x,y,z` / `--ur_aim x,y,z` re-aim the side camera without editing config; the
+rotation is computed as a level-horizon look-at. Keep the camera's x equal to the aim's
+x and the view stays square-on (table edges parallel to the image sides) — that is the
+whole reason for the current pose.
+
+### Workflow
+
+```bash
+# 1. collect (one episode per launch, as on the `single-camera` branch)
+python scripts/play.py --task RandomBlock --pilot SpaceMousePilot \
+  --num_envs 1 --record --yes --two_cam
+
+# 2. convert, carrying BOTH views
+python scripts/convert_demos.py \
+  --rollout_dir logs/rollouts/eval_RandomBlock_with_SpaceMousePilot \
+  --output logs/data/twocam_demos.npy --append \
+  --views "wrist:camera_wrist/rgb,side:camera_side/rgb"
+
+# 3. dataset with one image key per view
+python scripts/npy_to_lerobot.py --input logs/data/twocam_demos.npy \
+  --repo_id local/twocam --root logs/lerobot/twocam \
+  --images --image_names wrist,side --overwrite
+
+# 4. train — SmolVLA accepts three cameras; map the two onto camera1/camera2
+lerobot-train \
+  --policy.path=lerobot/smolvla_base --policy.push_to_hub=false \
+  --dataset.repo_id=local/twocam --dataset.root=logs/lerobot/twocam \
+  --dataset.video_backend=pyav \
+  --rename_map='{"observation.images.wrist": "observation.images.camera1", "observation.images.side": "observation.images.camera2"}' \
+  --batch_size=64 --steps=30000 --save_freq=5000 --num_workers=12 \
+  --output_dir=outputs/train/twocam_v1 --job_name=twocam_v1 --policy.device=cuda
+
+# 5. evaluate — --two_cam makes the env render what the checkpoint expects
+python scripts/eval_smolvla.py \
+  --checkpoint outputs/train/twocam_v1/checkpoints/025000/pretrained_model \
+  --num_episodes 200 --seed 123 --two_cam \
+  --n_action_steps 5 --max_steps 150 --debug_grounding --headless
+
+# shared autonomy, when a base policy exists
+python scripts/shared_autonomy.py --two_cam \
+  --checkpoint outputs/train/twocam_v1/checkpoints/025000/pretrained_model \
+  --num_episodes 10 --alpha 0.8 --rollout_dir logs/rollouts/twocam_sa_s1
+```
+
+- **Record one episode first** and confirm `camera_wrist/` and `camera_side/` both fill
+  with matching frame counts and no `camera_0/`. The Isaac-side recording is the part
+  that cannot be unit-tested, and a silent failure there costs a whole collection.
+- **`--views` and `--image_names` are what make it two-camera.** Omit them and the
+  tooling behaves exactly as on `main` (verified against an existing single-view
+  rollout), which is useful but will quietly give you a one-camera dataset.
+- Each view is probed for its own resolution, so the smaller wrist frames are fine.
+- Expect roughly 2x the dataset size and decode time of a single-view set; video decode
+  is already the training bottleneck.
+- The square 16 x 16 cm region is 40% smaller in area than the single-camera branch's 14 x 30 cm, so success
+  rates are **not** directly comparable to the [results](docs/RESULTS.md) there.
+
+### Residual on a frozen base (CR-DAgger-style)
+
+Finetuning the base on corrections never improved it ([docs/RESULTS.md](docs/RESULTS.md)
+sections 9-15). This alternative leaves the base frozen and trains a small network to
+predict only the position adjustment the corrections produced, then adds that
+adjustment to the base action at run time. Position-only, from SpaceMouse blending: no
+force sensing or force output, so it is inspired by CR-DAgger rather than an
+implementation of it.
+
+```bash
+# 1. dataset: label = a_exec - a_R per step (zero where there was no correction),
+#    plus frozen ResNet-18 features of both camera frames, computed once
+python scripts/residual_extract.py \
+  --rollouts 'logs/rollouts/tc_sa_s*' --output logs/data/tc_residual.npz
+
+# 2. train (seconds). --views none = robot state + base action only
+python scripts/residual_train.py --data logs/data/tc_residual.npz \
+  --views none --output outputs/residual/tc_residual_state.pt
+python scripts/residual_train.py --data logs/data/tc_residual.npz \
+  --views both --output outputs/residual/tc_residual_images.pt
+
+# 3. evaluate on the same 200 episodes as the base
+CK=outputs/train/twocam_v1/checkpoints/020000/pretrained_model
+COMMON="--num_episodes 200 --seed 123 --two_cam --debug_grounding --max_steps 150 --n_action_steps 5 --headless"
+python scripts/eval_smolvla.py --checkpoint $CK $COMMON \
+  --residual outputs/residual/tc_residual_state.pt 2>&1 | tee /tmp/eval200_tc_residual_state.log
+python scripts/eval_smolvla.py --checkpoint $CK $COMMON \
+  --residual outputs/residual/tc_residual_state.pt --residual_zero 2>&1 | tee /tmp/eval200_tc_residual_zero.log
+python scripts/eval_smolvla.py --checkpoint $CK $COMMON \
+  --residual outputs/residual/tc_residual_images.pt 2>&1 | tee /tmp/eval200_tc_residual_images.log
+```
+
+- **Read the held-out line `residual_train.py` prints.** With 80% of labels exactly
+  zero, "output nothing" is the trivial solution; the number that matters is the error
+  on held-out *corrective* steps against the error of predicting nothing. Episodes, not
+  steps, are held out — neighbouring steps of one episode are near-duplicates.
+- **`--residual_zero`** runs the whole residual path but applies no adjustment. It
+  should match the base's own result, which checks the added machinery changed nothing
+  else; any episodes that flip are the simulator's run-to-run noise.
+- **`--residual_cap`** (default 0.05 m) bounds the adjustment per step. The labels'
+  99th percentile is 5.1 cm; a 3 cm cap would clip 61% of the corrective labels.
+- **Image features did not help** at 100 episodes — the state-only network predicts
+  held-out corrections better (2.39 cm vs 2.55 cm error, against 3.26 cm for predicting
+  nothing). Most of what the corrections contain is one consistent nudge: about 1 cm
+  down and toward -y just before the grasp.
+- Orientation and gripper are left to the base.
+- **Result** ([docs/RESULTS.md](docs/RESULTS.md) section 17): neither residual
+  changed the success rate measurably — state 151/200, images 155/200, zero adjustment
+  157/200, base 142/200 in each of two runs (state vs base p = 0.35). Two plain base
+  runs disagreed on 72 of 200 episodes: the simulator is not repeatable between runs.
+  Why the zero-adjustment run scored higher than both is unresolved.
+
+### Takeover corrections (HG-DAgger-style), aimed at raising success
+
+Every earlier correction round blended (alpha 0.5 / 0.8), so the robot followed the
+operator only partly and the corrections came out as small generic nudges. Here the
+operator takes **full control** while touching the SpaceMouse (`--alpha 0`; idle
+gating still hands control back the moment they let go), and corrects only episodes
+that are going wrong. On those steps the human action *is* the executed action, so the
+label is both the human's intent and self-consistent with the observations.
+
+```bash
+# 1. collect, 10 sessions of 10 against the frozen base (change s1 .. s10)
+python scripts/shared_autonomy.py --two_cam \
+  --checkpoint outputs/train/twocam_v1/checkpoints/020000/pretrained_model \
+  --num_episodes 10 --alpha 0 --replan_on_release --rollout_dir logs/rollouts/tc_to_s1
+
+# 2. convert every session (label = executed action = yours while you steer)
+for i in $(seq 1 10); do
+  python scripts/convert_demos.py --rollout_dir logs/rollouts/tc_to_s$i \
+    --output logs/data/tc_takeover.npy --append --action_prefix exec_action \
+    --views "wrist:camera_wrist/rgb,side:camera_side/rgb"
+done
+
+# 3. pool with ALL 240 base demos, build the dataset
+python scripts/merge_npy_datasets.py --inputs logs/data/tc_takeover.npy logs/data/twocam_demos.npy \
+  --take all all --seed 0 --output logs/data/tc_to_mix.npy
+python scripts/npy_to_lerobot.py --input logs/data/tc_to_mix.npy \
+  --repo_id local/tc_to_mix --root logs/lerobot/tc_to_mix \
+  --images --image_names wrist,side --overwrite
+
+# 4. finetune from the base (same recipe as tc_ft_*, more steps for the larger set)
+lerobot-train \
+  --policy.path=outputs/train/twocam_v1/checkpoints/020000/pretrained_model \
+  --policy.push_to_hub=false \
+  --dataset.repo_id=local/tc_to_mix --dataset.root=logs/lerobot/tc_to_mix \
+  --dataset.video_backend=pyav \
+  --rename_map='{"observation.images.wrist": "observation.images.camera1", "observation.images.side": "observation.images.camera2"}' \
+  --policy.optimizer_lr=2.5e-5 --policy.scheduler_decay_lr=2.5e-6 \
+  --batch_size=64 --steps=6000 --save_freq=6000 --num_workers=12 --seed=1000 \
+  --output_dir=outputs/train/tc_ft_takeover --job_name=tc_ft_takeover --policy.device=cuda
+
+# 5. evaluate the final checkpoint on the usual 200 episodes; compare with the base (142, 142)
+python scripts/eval_smolvla.py \
+  --checkpoint outputs/train/tc_ft_takeover/checkpoints/006000/pretrained_model \
+  --num_episodes 200 --seed 123 --two_cam --debug_grounding --max_steps 150 \
+  --n_action_steps 5 --headless 2>&1 | tee /tmp/eval200_tc_ft_takeover.log
+```
+
+- **Only take over when the episode is going wrong** — hovering off the block,
+  descending beside it, closing on nothing. Leave good episodes alone; untouched steps
+  are labelled with the robot's own action and add little.
+- **Finish the grasp yourself**, lift, then let go: `--replan_on_release` makes the
+  robot replan from where you left the arm instead of finishing a stale chunk.
+- **The gripper stays yours once you press a button**, for the rest of the episode
+  (`--grip_hold_steps 0`). Open it over the bin yourself.
+- Evaluate only the final checkpoint, decided in advance. Two plain base runs scored
+  142 and 142 but flip ~70 episodes between them, so treat a gain under ~15/200 as
+  not shown.
+
+### Weaker base, alpha 0.5
+
+Corrections on `twocam_v1/010000` (halfway through base training, chosen before it was
+evaluated) at alpha = 0.5: more failures to correct than at 020000, and both labels
+can again be built from the same episodes.
+
+```bash
+# collect, 10 sessions of 10 (change s1 .. s10)
+python scripts/shared_autonomy.py --two_cam \
+  --checkpoint outputs/train/twocam_v1/checkpoints/010000/pretrained_model \
+  --num_episodes 10 --alpha 0.5 --rollout_dir logs/rollouts/tc10k_a05_s1
+
+# the base's own score, needed as the comparison
+python scripts/eval_smolvla.py \
+  --checkpoint outputs/train/twocam_v1/checkpoints/010000/pretrained_model \
+  --num_episodes 200 --seed 123 --two_cam --debug_grounding --max_steps 150 \
+  --n_action_steps 5 --headless 2>&1 | tee /tmp/eval200_twocam_v1_010000.log
+```
+
+Three arms, each finetuned from `010000` for 6,000 steps: corrections labelled `blend`
+(a_exec) + all 240 demos, corrections labelled `human` (a_H) + all 240 demos, and the
+240 demos alone (the control that separates "corrections helped" from "more training
+helped"). Plan fixed in [docs/RESULTS.md](docs/RESULTS.md) section 18.
+
+**Videos of the models** — `--video_dir` saves every episode as a captioned MP4 (side |
+wrist view, model name, instruction, outcome). Same `--seed`, so each model plays the
+same layouts. For viewing only; take success rates from runs without it. Keep
+`--debug_grounding`: every evaluation used it, and it changes SmolVLA's random-number
+stream, so the clips then match how the evaluations ran.
+
+```bash
+LOOK="--num_episodes 10 --seed 123 --two_cam --debug_grounding --max_steps 150 --n_action_steps 5 --headless"
+python scripts/eval_smolvla.py --checkpoint outputs/train/twocam_v1/checkpoints/010000/pretrained_model \
+  $LOOK --video_dir logs/videos/base_010000
+for M in tc10k_ft_blend tc10k_ft_human tc10k_demos_only; do
+  python scripts/eval_smolvla.py --checkpoint outputs/train/$M/checkpoints/006000/pretrained_model \
+    $LOOK --video_dir logs/videos/$M
+done
+```
+
+**Give the robot your own instructions** — `--interactive` pauses at the start of every
+episode, shows the new random scene, and asks for the instruction in the terminal: a
+colour (`red` / `green` / `blue`), any sentence (*"grab the green one and drop it in the
+bin"*), Enter to keep the scene's own, or `q` to quit. A colour named in the sentence
+becomes the target success is scored on. The models were trained on one sentence
+template, so other phrasings test how far the language understanding stretches.
+
+```bash
+python scripts/eval_smolvla.py \
+  --checkpoint outputs/train/tc10k_ft_human/checkpoints/006000/pretrained_model \
+  --num_episodes 20 --two_cam --debug_grounding --max_steps 150 --n_action_steps 5 --interactive
+```
+
+**Result** (section 19): base 136/200, control 135, blend 150, **human 158** (human vs
+control p = 0.012; blend vs control p = 0.096). The first round in which corrections
+raised the success rate; extra training on demos alone did not.
+
+```bash
+# build (CPU only): convert per label, pool with ALL 240 demos, LeRobot format
+P=~/Residual_Copilot/.venv/bin/python
+for M in human blend; do
+  for i in $(seq 1 10); do
+    $P scripts/convert_demos.py --rollout_dir logs/rollouts/tc10k_a05_s$i \
+      --output logs/data/tc10k_corr_$M.npy --append --action_prefix $M --angle_threshold 0 \
+      --views "wrist:camera_wrist/rgb,side:camera_side/rgb"
+  done
+  $P scripts/merge_npy_datasets.py --inputs logs/data/tc10k_corr_$M.npy logs/data/twocam_demos.npy \
+    --take all all --seed 0 --output logs/data/tc10k_mix_$M.npy
+  $P scripts/npy_to_lerobot.py --input logs/data/tc10k_mix_$M.npy \
+    --repo_id local/tc10k_mix_$M --root logs/lerobot/tc10k_mix_$M \
+    --images --image_names wrist,side --overwrite
+done
+
+# train the three arms one after another (the control reuses the base's own dataset)
+for ARM in blend human control; do
+  if [ $ARM = control ]; then DS=twocam; OUT=tc10k_demos_only; else DS=tc10k_mix_$ARM; OUT=tc10k_ft_$ARM; fi
+  lerobot-train \
+    --policy.path=outputs/train/twocam_v1/checkpoints/010000/pretrained_model \
+    --policy.push_to_hub=false \
+    --dataset.repo_id=local/$DS --dataset.root=logs/lerobot/$DS --dataset.video_backend=pyav \
+    --rename_map='{"observation.images.wrist": "observation.images.camera1", "observation.images.side": "observation.images.camera2"}' \
+    --policy.optimizer_lr=2.5e-5 --policy.scheduler_decay_lr=2.5e-6 \
+    --batch_size=64 --steps=6000 --save_freq=6000 --num_workers=12 --seed=1000 \
+    --output_dir=outputs/train/$OUT --job_name=$OUT --policy.device=cuda
+done
+
+# evaluate the base and the three arms on the same 200 episodes
+COMMON="--num_episodes 200 --seed 123 --two_cam --debug_grounding --max_steps 150 --n_action_steps 5 --headless"
+python scripts/eval_smolvla.py --checkpoint outputs/train/twocam_v1/checkpoints/010000/pretrained_model \
+  $COMMON 2>&1 | tee /tmp/eval200_twocam_v1_010000.log
+for M in tc10k_ft_blend tc10k_ft_human tc10k_demos_only; do
+  python scripts/eval_smolvla.py --checkpoint outputs/train/$M/checkpoints/006000/pretrained_model \
+    $COMMON 2>&1 | tee /tmp/eval200_$M.log
+done
+```
+
+### 5k base, alpha 0.5 (replication)
+
+Same procedure as the 10k round, with fresh corrections on `twocam_v1/005000`. Plan and
+decision rule in [docs/RESULTS.md](docs/RESULTS.md) section 20.
+
+**Result** (section 21): base 100/200, control 119, blend 113, human 107 — no gain from
+corrections over the control (human vs control p = 0.29). The 10k gain did not
+replicate; the decision rule calls for a training-seed replication of the 10k arms.
+
+```bash
+# collect, 10 sessions of 10 (change s1 .. s10)
+python scripts/shared_autonomy.py --two_cam \
+  --checkpoint outputs/train/twocam_v1/checkpoints/005000/pretrained_model \
+  --num_episodes 10 --alpha 0.5 --rollout_dir logs/rollouts/tc5k_a05_s1
+
+# build: as the 10k round with tc10k -> tc5k (logs/data/tc5k_mix_{human,blend}.npy,
+# local/tc5k_mix_{human,blend})
+
+# train the three arms from 005000
+for ARM in blend human control; do
+  if [ $ARM = control ]; then DS=twocam; OUT=tc5k_demos_only; else DS=tc5k_mix_$ARM; OUT=tc5k_ft_$ARM; fi
+  lerobot-train \
+    --policy.path=outputs/train/twocam_v1/checkpoints/005000/pretrained_model \
+    --policy.push_to_hub=false \
+    --dataset.repo_id=local/$DS --dataset.root=logs/lerobot/$DS --dataset.video_backend=pyav \
+    --rename_map='{"observation.images.wrist": "observation.images.camera1", "observation.images.side": "observation.images.camera2"}' \
+    --policy.optimizer_lr=2.5e-5 --policy.scheduler_decay_lr=2.5e-6 \
+    --batch_size=64 --steps=6000 --save_freq=6000 --num_workers=12 --seed=1000 \
+    --output_dir=outputs/train/$OUT --job_name=$OUT --policy.device=cuda
+done
+
+# evaluate the 5k base and the three arms
+COMMON="--num_episodes 200 --seed 123 --two_cam --debug_grounding --max_steps 150 --n_action_steps 5 --headless"
+python scripts/eval_smolvla.py --checkpoint outputs/train/twocam_v1/checkpoints/005000/pretrained_model \
+  $COMMON 2>&1 | tee /tmp/eval200_twocam_v1_005000.log
+for M in tc5k_ft_blend tc5k_ft_human tc5k_demos_only; do
+  python scripts/eval_smolvla.py --checkpoint outputs/train/$M/checkpoints/006000/pretrained_model \
+    $COMMON 2>&1 | tee /tmp/eval200_$M.log
+done
+```
+
+### Training-seed replication of the 10k arms
+
+Required by the section 20 decision rule after the 5k round failed to replicate: the
+same three 10k arms, same data and recipe, `--seed 2000` instead of 1000.
+
+**Result** (section 22): control 141, blend 146, human 155 (seed 1000: 135, 150, 158).
+The human arm's gain over the control persists at a smaller size (+14; pooled over both
+seeds p = 0.004).
+
+**Paired re-evaluation** (section 25, identical layouts after the section 23 fix):
+base 130; control 140 / 136; blend 148 / 149; human 137 / 153 (seeds 1000 / 2000).
+Human vs control, both seeds: p = 0.18 (pre-registered primary, not significant); blend
+vs control p = 0.026 (secondary). This supersedes the unpaired numbers.
+
+```bash
+for ARM in blend human control; do
+  if [ $ARM = control ]; then DS=twocam; OUT=tc10k_demos_only_s2; else DS=tc10k_mix_$ARM; OUT=tc10k_ft_${ARM}_s2; fi
+  lerobot-train \
+    --policy.path=outputs/train/twocam_v1/checkpoints/010000/pretrained_model \
+    --policy.push_to_hub=false \
+    --dataset.repo_id=local/$DS --dataset.root=logs/lerobot/$DS --dataset.video_backend=pyav \
+    --rename_map='{"observation.images.wrist": "observation.images.camera1", "observation.images.side": "observation.images.camera2"}' \
+    --policy.optimizer_lr=2.5e-5 --policy.scheduler_decay_lr=2.5e-6 \
+    --batch_size=64 --steps=6000 --save_freq=6000 --num_workers=12 --seed=2000 \
+    --output_dir=outputs/train/$OUT --job_name=$OUT --policy.device=cuda
+done
+
+COMMON="--num_episodes 200 --seed 123 --two_cam --debug_grounding --max_steps 150 --n_action_steps 5 --headless"
+for M in tc10k_ft_blend_s2 tc10k_ft_human_s2 tc10k_demos_only_s2; do
+  python scripts/eval_smolvla.py --checkpoint outputs/train/$M/checkpoints/006000/pretrained_model \
+    $COMMON 2>&1 | tee /tmp/eval200_$M.log
+done
+```
+
+### Paired evaluation (layouts matched across models)
+
+Until 2026-10-27, models evaluated with the same `--seed` saw the same target colours but
+**different block layouts** after the first episode or two: layouts drew from the same
+random stream as SmolVLA's sampling noise ([docs/RESULTS.md](docs/RESULTS.md) section
+23). Layouts now come from their own generator, so **every evaluation with `--seed 123`
+faces the same 200 layouts**, and a new model can be compared episode-for-episode with
+any model already evaluated after the fix. Paired logs are named `eval200p_*.log`.
+
+```bash
+COMMON="--num_episodes 200 --seed 123 --two_cam --debug_grounding --max_steps 150 --n_action_steps 5 --headless"
+python scripts/eval_smolvla.py --checkpoint outputs/train/twocam_v1/checkpoints/010000/pretrained_model \
+  $COMMON 2>&1 | tee docs/eval_logs/eval200p_twocam_v1_010000.log
+for M in tc10k_demos_only tc10k_ft_blend tc10k_ft_human tc10k_demos_only_s2 tc10k_ft_blend_s2 tc10k_ft_human_s2; do
+  python scripts/eval_smolvla.py --checkpoint outputs/train/$M/checkpoints/006000/pretrained_model \
+    $COMMON 2>&1 | tee docs/eval_logs/eval200p_$M.log
+done
+```
+
+**Result** (section 25): base 130; control 140 / 136; blend 148 / 149; human 137 / 153
+(seeds 1000 / 2000). Human vs control, both seeds, p = 0.18; blend vs control p = 0.026.
+Evaluations before the fix (`eval200_*.log`) remain valid but unpaired.
+
+### 10k base, alpha 0.8 (same base, only alpha changes)
+
+Corrections on `twocam_v1/010000` at alpha = 0.8, to compare with the alpha = 0.5 round
+on the same base, recipe and (paired) layouts. The base and the demos-only controls are
+the same for any alpha and are already evaluated, so only the four correction arms are
+new.
+
+```bash
+# collect, 10 sessions of 10 (change s1 .. s10)
+python scripts/shared_autonomy.py --two_cam \
+  --checkpoint outputs/train/twocam_v1/checkpoints/010000/pretrained_model \
+  --num_episodes 10 --alpha 0.8 --rollout_dir logs/rollouts/tc10k_a08_s1
+
+# build (CPU only)
+P=~/Residual_Copilot/.venv/bin/python
+for M in human blend; do
+  for i in $(seq 1 10); do
+    $P scripts/convert_demos.py --rollout_dir logs/rollouts/tc10k_a08_s$i \
+      --output logs/data/tc10k08_corr_$M.npy --append --action_prefix $M --angle_threshold 0 \
+      --views "wrist:camera_wrist/rgb,side:camera_side/rgb"
+  done
+  $P scripts/merge_npy_datasets.py --inputs logs/data/tc10k08_corr_$M.npy logs/data/twocam_demos.npy \
+    --take all all --seed 0 --output logs/data/tc10k08_mix_$M.npy
+  $P scripts/npy_to_lerobot.py --input logs/data/tc10k08_mix_$M.npy \
+    --repo_id local/tc10k08_mix_$M --root logs/lerobot/tc10k08_mix_$M \
+    --images --image_names wrist,side --overwrite
+done
+
+# train blend and human at training seeds 1000 and 2000 (as the alpha 0.5 arms)
+for SEED in 1000 2000; do
+  SUF=$([ $SEED = 2000 ] && echo _s2)
+  for ARM in blend human; do
+    OUT=tc10k08_ft_${ARM}${SUF}
+    lerobot-train \
+      --policy.path=outputs/train/twocam_v1/checkpoints/010000/pretrained_model \
+      --policy.push_to_hub=false \
+      --dataset.repo_id=local/tc10k08_mix_$ARM --dataset.root=logs/lerobot/tc10k08_mix_$ARM \
+      --dataset.video_backend=pyav \
+      --rename_map='{"observation.images.wrist": "observation.images.camera1", "observation.images.side": "observation.images.camera2"}' \
+      --policy.optimizer_lr=2.5e-5 --policy.scheduler_decay_lr=2.5e-6 \
+      --batch_size=64 --steps=6000 --save_freq=6000 --num_workers=12 --seed=$SEED \
+      --output_dir=outputs/train/$OUT --job_name=$OUT --policy.device=cuda
+  done
+done
+
+# evaluate the four arms (paired with the existing eval200p_ logs)
+COMMON="--num_episodes 200 --seed 123 --two_cam --debug_grounding --max_steps 150 --n_action_steps 5 --headless"
+for M in tc10k08_ft_blend tc10k08_ft_human tc10k08_ft_blend_s2 tc10k08_ft_human_s2; do
+  python scripts/eval_smolvla.py --checkpoint outputs/train/$M/checkpoints/006000/pretrained_model \
+    $COMMON 2>&1 | tee docs/eval_logs/eval200p_$M.log
+done
+```
+
+- At alpha = 0.8 the operator has 20% authority: the arm moves only a little toward
+  the SpaceMouse. Correct as you naturally would.
+- Disk: recordings + datasets + four models need about 7-8 GB; delete each model's
+  `training_state/` after it is backed up (it is only needed to resume training).
+
+**Result** (RESULTS section 27): blend 147 / 141, human 139 / 146 (seeds 1000 / 2000)
+out of 200. Human vs blend p = 0.85; alpha 0.8 vs 0.5 no difference; no arm beats the
+demos-only control. On this base the label does not matter at alpha 0.8 either.
+
+### 10k base, alpha 0.8, 50 demos (does the demo mix hide the label effect?)
+
+Plan in [docs/RESULTS.md](docs/RESULTS.md) section 28. The same alpha 0.8 corrections,
+but mixed with the 50-demo ballast of the earlier two-camera round instead of all 240
+demos, and trained for 4,000 steps as that round was. No new collection.
+
+```bash
+# build (CPU only)
+P=~/Residual_Copilot/.venv/bin/python
+for M in human blend; do
+  $P scripts/merge_npy_datasets.py --inputs logs/data/tc10k08_corr_$M.npy logs/data/tc_ballast.npy \
+    --take all all --seed 0 --output logs/data/tc10k08b_mix_$M.npy
+  $P scripts/npy_to_lerobot.py --input logs/data/tc10k08b_mix_$M.npy \
+    --repo_id local/tc10k08b_mix_$M --root logs/lerobot/tc10k08b_mix_$M \
+    --images --image_names wrist,side --overwrite
+done
+
+# train blend and human at training seeds 1000 and 2000
+for SEED in 1000 2000; do
+  SUF=$([ $SEED = 2000 ] && echo _s2)
+  for ARM in blend human; do
+    OUT=tc10k08b_ft_${ARM}${SUF}
+    lerobot-train \
+      --policy.path=outputs/train/twocam_v1/checkpoints/010000/pretrained_model \
+      --policy.push_to_hub=false \
+      --dataset.repo_id=local/tc10k08b_mix_$ARM --dataset.root=logs/lerobot/tc10k08b_mix_$ARM \
+      --dataset.video_backend=pyav \
+      --rename_map='{"observation.images.wrist": "observation.images.camera1", "observation.images.side": "observation.images.camera2"}' \
+      --policy.optimizer_lr=2.5e-5 --policy.scheduler_decay_lr=2.5e-6 \
+      --batch_size=64 --steps=4000 --save_freq=4000 --num_workers=12 --seed=$SEED \
+      --output_dir=outputs/train/$OUT --job_name=$OUT --policy.device=cuda
+  done
+done
+
+# evaluate (paired with the existing eval200p_ logs)
+COMMON="--num_episodes 200 --seed 123 --two_cam --debug_grounding --max_steps 150 --n_action_steps 5 --headless"
+for M in tc10k08b_ft_blend tc10k08b_ft_human tc10k08b_ft_blend_s2 tc10k08b_ft_human_s2; do
+  python scripts/eval_smolvla.py --checkpoint outputs/train/$M/checkpoints/004000/pretrained_model \
+    $COMMON 2>&1 | tee docs/eval_logs/eval200p_$M.log
+done
+```
+
+Control: the same 50 demos alone, 1,400 steps (as `tc_ballast_only`), after the
+evaluations above so it does not share the GPU with them.
+
+```bash
+for SEED in 1000 2000; do
+  OUT=tc10k08b_demos_only$([ $SEED = 2000 ] && echo _s2)
+  lerobot-train \
+    --policy.path=outputs/train/twocam_v1/checkpoints/010000/pretrained_model \
+    --policy.push_to_hub=false \
+    --dataset.repo_id=local/tc_ballast --dataset.root=logs/lerobot/tc_ballast \
+    --dataset.video_backend=pyav \
+    --rename_map='{"observation.images.wrist": "observation.images.camera1", "observation.images.side": "observation.images.camera2"}' \
+    --policy.optimizer_lr=2.5e-5 --policy.scheduler_decay_lr=2.5e-6 \
+    --batch_size=64 --steps=1400 --save_freq=1400 --num_workers=12 --seed=$SEED \
+    --output_dir=outputs/train/$OUT --job_name=$OUT --policy.device=cuda
+done
+for M in tc10k08b_demos_only tc10k08b_demos_only_s2; do
+  python scripts/eval_smolvla.py --checkpoint outputs/train/$M/checkpoints/001400/pretrained_model \
+    $COMMON 2>&1 | tee docs/eval_logs/eval200p_$M.log
+done
+```
+
+**Result** (RESULTS section 29): blend 147 / 152, human 105 / 99, 50-demo control
+135 / 133 (seeds 1000 / 2000) out of 200. Human vs blend p = 3e-13; blend vs control
+p = 0.0013. With few demos the human label hurts and the blend label helps.
+
+### 10k base, alpha 0.5, 50 demos (does the label matter at alpha 0.5 once undiluted?)
+
+Plan in [docs/RESULTS.md](docs/RESULTS.md) section 30. The existing alpha 0.5 corrections
+(`tc10k_corr_*`) with the same 50-demo recipe as the alpha 0.8 round, so only alpha
+differs. The 50-demo controls are reused. No new collection.
+
+```bash
+# build (CPU only)
+P=~/Residual_Copilot/.venv/bin/python
+for M in human blend; do
+  $P scripts/merge_npy_datasets.py --inputs logs/data/tc10k_corr_$M.npy logs/data/tc_ballast.npy \
+    --take all all --seed 0 --output logs/data/tc10k05b_mix_$M.npy
+  $P scripts/npy_to_lerobot.py --input logs/data/tc10k05b_mix_$M.npy \
+    --repo_id local/tc10k05b_mix_$M --root logs/lerobot/tc10k05b_mix_$M \
+    --images --image_names wrist,side --overwrite
+done
+
+# train, then evaluate (paired with the existing eval200p_ logs)
+for SEED in 1000 2000; do
+  SUF=$([ $SEED = 2000 ] && echo _s2)
+  for ARM in blend human; do
+    OUT=tc10k05b_ft_${ARM}${SUF}
+    lerobot-train \
+      --policy.path=outputs/train/twocam_v1/checkpoints/010000/pretrained_model \
+      --policy.push_to_hub=false \
+      --dataset.repo_id=local/tc10k05b_mix_$ARM --dataset.root=logs/lerobot/tc10k05b_mix_$ARM \
+      --dataset.video_backend=pyav \
+      --rename_map='{"observation.images.wrist": "observation.images.camera1", "observation.images.side": "observation.images.camera2"}' \
+      --policy.optimizer_lr=2.5e-5 --policy.scheduler_decay_lr=2.5e-6 \
+      --batch_size=64 --steps=4000 --save_freq=4000 --num_workers=12 --seed=$SEED \
+      --output_dir=outputs/train/$OUT --job_name=$OUT --policy.device=cuda
+  done
+done
+COMMON="--num_episodes 200 --seed 123 --two_cam --debug_grounding --max_steps 150 --n_action_steps 5 --headless"
+for M in tc10k05b_ft_blend tc10k05b_ft_human tc10k05b_ft_blend_s2 tc10k05b_ft_human_s2; do
+  python scripts/eval_smolvla.py --checkpoint outputs/train/$M/checkpoints/004000/pretrained_model \
+    $COMMON 2>&1 | tee docs/eval_logs/eval200p_$M.log
+done
+```
+
+- Check the GPU is free first (`nvidia-smi`): training needs well over 10 GB.
+
+**Result** (RESULTS section 31): blend 146 / 139, human 133 / 144, 50-demo control
+135 / 133 (seeds 1000 / 2000) out of 200. Human vs blend p = 0.49: at alpha 0.5 the label
+does not matter even with few demos. See "Final conclusions" at the top of RESULTS.
+
+## HuggingFace Collection
+
+All data, models, and assets are hosted as a [HuggingFace collection](https://huggingface.co/collections/shashuo0104/residual-copilot), auto-downloaded on first use.
+
+| Repo | Contents |
+|------|----------|
+| [`residual_copilot_assets`](https://huggingface.co/datasets/shashuo0104/residual_copilot_assets) | Robot USD/URDF, object meshes, camera params |
+| [`residual_copilot_models`](https://huggingface.co/shashuo0104/residual_copilot_models) | BC pilots, RL copilot checkpoints, DP baselines |
+| [`residual_copilot_data`](https://huggingface.co/datasets/shashuo0104/residual_copilot_data) | Teleoperation trajectories |
+
+See each HuggingFace repo for the detailed file structure.
