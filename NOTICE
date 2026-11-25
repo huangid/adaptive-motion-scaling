@@ -10,3 +10,12 @@ scripts, and the motion-scaling work in this repository.
 
 third_party/lerobot is a git submodule of LeRobot (https://github.com/huggingface/lerobot),
 distributed under its own license.
+
+The tube transfer task displays a test tube rack and a test tube from LabUtopia
+(Li et al., 2025, "LabUtopia: High-Fidelity Simulation and Hierarchical Benchmark for
+Scientific Embodied Agents", https://arxiv.org/abs/2505.22634), published at
+https://huggingface.co/datasets/Ruinwalker/LabUtopia-Dataset under CC BY-NC 4.0
+(https://creativecommons.org/licenses/by-nc/4.0/). The files are downloaded at runtime and
+are not distributed with this repository. The tube is cut out of LabUtopia's TestTube_02
+set, the rack is re-triangulated and shortened from six holes to three (source) and one
+(destination), and both models are rescaled to fit the task's colliders.

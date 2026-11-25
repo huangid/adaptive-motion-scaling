@@ -68,8 +68,18 @@ of human control.
 
 ## Status
 
-Just started. The codebase is inherited (see below) and has not yet been adapted to
-this project.
+Step 1 (task design) is in progress. The **tube transfer** task is built: move a test tube
+from a 3-hole rack to a single-hole holder, alternating precise grasping and insertion with
+a long, coarse carry. Both racks are placed at random each episode, and the tube starts in
+a random hole. The tube and racks are drawn with [LabUtopia](https://arxiv.org/abs/2505.22634)
+models over invisible solid colliders. Design, settings and commands:
+[docs/TUBE_TRANSFER.md](docs/TUBE_TRANSFER.md).
+
+```bash
+scripts/isaac_python.sh scripts/play.py --task TubeTransfer --pilot SpaceMousePilot --num_envs 1 --two_cam
+```
+
+The rest of the inherited codebase (see below) has not yet been adapted.
 
 ## Starting point
 
@@ -104,6 +114,18 @@ UV_HTTP_TIMEOUT=300 uv sync
 python scripts/list_envs.py   # confirm environment registration
 ```
 
+**Using an existing environment instead.** `uv sync` downloads several GB. If another
+checkout of this codebase already has a working Isaac Sim venv, `scripts/isaac_python.sh`
+runs Python from it while loading this repo's code (by default the venv in
+`~/Residual_Copilot`; override with `ISAAC_VENV=/path/to/.venv`). It also sets the
+`LD_PRELOAD` that Isaac Sim needs:
+
+```bash
+scripts/isaac_python.sh scripts/list_envs.py
+```
+
+Running `python scripts/...` from the other checkout runs *its* code, not this repo's.
+
 ## References
 
 1. Yoon et al. (2025). *SIMS: Surgeon-Intention-driven Motion Scaling.*
@@ -118,3 +140,9 @@ python scripts/list_envs.py   # confirm environment registration
 
 Apache License 2.0 (see [LICENSE](LICENSE)). Based on the Residual Copilot codebase,
 also released under Apache-2.0; see [NOTICE](NOTICE).
+
+The tube transfer task displays a test tube and rack from
+[LabUtopia](https://huggingface.co/datasets/Ruinwalker/LabUtopia-Dataset) (Li et al., 2025,
+[arXiv:2505.22634](https://arxiv.org/abs/2505.22634)), licensed **CC BY-NC 4.0**:
+non-commercial use, with attribution. They are downloaded at runtime and not distributed
+here. Cite the LabUtopia paper in any publication that shows the task.

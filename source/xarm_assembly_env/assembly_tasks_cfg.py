@@ -532,3 +532,103 @@ class NutThread(AssemblyTask):
         history_length=6,
         debug_vis=False,
     )
+
+
+@configclass
+class TubeTransfer(AssemblyTask):
+    """Move a test tube from a source rack to an empty destination rack.
+
+    The task for the adaptive motion scaling study. Each trip has precise phases (grasp
+    the tube, pull it straight out, line it up over a hole, lower it in) separated by a
+    fast, coarse carry across the table, so the right SpaceMouse gain changes several
+    times per episode.
+
+    The cameras see LabUtopia's test tube and racks, shortened to the configured number of
+    holes (see ``lab_assets.py``). Physics uses invisible solid stand-ins: a cylinder for the tube and
+    thick boxes around a row of square holes for each rack. The visual rack is stretched sideways so its round holes
+    match the collider holes, ``tube diameter + rack_clearance`` wide.
+
+    Both racks lie lengthwise along x (pointing away from the robot) with their holes in a
+    row. Coordinates are in the robot base frame (x forward, y left, z up), metres.
+    """
+
+    name = "tube_transfer"
+    duration_s = 60.0
+    instruction: str = "move the test tube to the empty rack"
+
+    # --- Tube (collider: solid cylinder) ---
+    # 2.4 cm diameter. A 1.5 cm tube is too thin for this gripper in sim: the fingers
+    # only reach it near full close (1 of 2 scripted transfers held; with the command
+    # capped at 1.1 it was never gripped).
+    tube_radius: float = 0.012
+    tube_height: float = 0.15         # a 25 x 150 mm test tube
+    tube_mass: float = 0.03
+
+    # --- Racks ---
+    # Holes per rack, in a row (1-6; LabUtopia's model has 6 and is shortened to fit).
+    # The source has three, so where the tube starts varies. The destination has one, so
+    # the operator and the policy always share the same goal: with several target holes
+    # the policy could head for a different one than the operator, and blending would then
+    # pull against them.
+    source_rack_holes: int = 3
+    dest_rack_holes: int = 1
+    # Hole width = tube diameter + clearance. Larger is easier to insert into.
+    rack_clearance: float = 0.006
+    # Height scale for the rack model (its upper plate sits 9.5 cm above the table at 1.0).
+    rack_scale_z: float = 1.0
+
+    # --- Appearance ---
+    # False shows the plain collider shapes instead (no download needed).
+    use_lab_visuals: bool = True
+    # Which tube of LabUtopia's TestTube_02 set to use, 0-4 (see lab_assets.TUBE_LIQUID).
+    lab_tube_index: int = 1           # orange liquid, about half full
+    # Colours of the collider shapes, used only when use_lab_visuals is False.
+    tube_color: tuple = (0.15, 0.45, 0.85)
+    source_rack_color: tuple = (0.55, 0.55, 0.55)
+    dest_rack_color: tuple = (0.85, 0.85, 0.85)
+
+    # --- Layout ---
+    # Rack positions are the middle of the hole row, resampled uniformly in these regions
+    # every episode; the tube starts in a random source hole. Every carry is roughly
+    # 0.30-0.45 m. The destination moves too (+-3 cm around the spot under the side
+    # camera) so the target must be seen: with a fixed target, a hand-written "slow down
+    # near this point" rule could stand in for policy-informed scaling.
+    source_x_range: tuple = (0.32, 0.42)
+    source_y_range: tuple = (0.14, 0.22)
+    dest_x_range: tuple = (0.34, 0.40)
+    dest_y_range: tuple = (-0.21, -0.15)
+    # When set, every reset draws the SAME layout (rack positions and starting hole), for
+    # practice, debugging, or a fixed set of evaluation layouts. None = fresh each episode.
+    layout_seed: int | None = None
+    # Height of the table surface in the robot base frame. Measured: a free tube settles
+    # with its bottom at z = -0.0045 (RandomBlock's blocks give the same, -0.0043).
+    table_top_z: float = -0.0045
+
+    # --- Robot start: fingertip between the racks, clear above the tube ---
+    start_eef_xy: tuple = (0.37, 0.0)
+    start_eef_z: float = 0.27
+
+    # --- Success: tube seated in the destination hole, upright, and let go ---
+    seat_tolerance: float = 0.01      # tube bottom within this of the table
+    upright_tolerance_deg: float = 15.0
+    release_gripper_thresh: float = 0.2   # gripper obs below this counts as open
+    # Failure: tube knocked over, or dropped off the table.
+    tipped_deg: float = 45.0
+
+    # gripper clamp values
+    gripper_obs_clamp: float = 1.0
+    # Cap on the closing command (joint target, full close = 1.6). Measured with the
+    # 2.4 cm tube: 1.1 never touches it (0/4 scripted transfers), 1.6 squeezes it out of
+    # the fingers (0/6), 1.3 holds it (4/4). Retune if tube_radius changes.
+    gripper_ctrl_clamp: float = 1.3
+
+    # Only the friction values are read here; geometry comes from the fields above.
+    held_asset_cfg = HeldAssetCfg(friction=1.0)
+    fixed_asset_cfg = FixedAssetCfg(friction=0.5)
+
+    held_asset_contact_sensor_cfg = ContactSensorCfg(
+        prim_path="/World/envs/env_.*/Tube",
+        update_period=0.0,
+        history_length=6,
+        debug_vis=False,
+    )

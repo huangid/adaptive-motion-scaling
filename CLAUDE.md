@@ -8,9 +8,29 @@ This repo studies **policy-informed adaptive motion scaling** for SpaceMouse tel
 one VLA provides both action blending (To the Noise and Back-style partial denoising) and
 adaptive scaling of the operator's input gain, compared in a 2 × 2 study. See `README.md`.
 
-The code below is inherited from Residual Copilot via `huangid/vla-shared-autonomy`
-(branch `two-camera`); the sections that follow describe that inherited code. Its full
-command reference is in `docs/BASE_README.md`.
+Most of the code is inherited from Residual Copilot via `huangid/vla-shared-autonomy`
+(branch `two-camera`); the sections after "Tube transfer task" describe that inherited code.
+Its full command reference is in `docs/BASE_README.md`.
+
+## Tube transfer task (this project)
+
+The study's task: move a test tube from a 3-hole source rack to a single-hole holder, both
+placed at random each episode. Full design, settings and rationale: `docs/TUBE_TRANSFER.md`.
+
+- `source/xarm_assembly_env/tube_transfer_env.py`: `XArmTubeTransferEnv`, a self-contained
+  subclass of `XArmEnv`. Add tube-transfer logic here, not as new `name ==` branches in
+  `xarm_env.py`.
+- `source/xarm_assembly_env/lab_assets.py`: downloads LabUtopia's rack and tube (CC BY-NC 4.0,
+  pinned revision) and prepares them (re-triangulates the rack, shortens it, cuts one tube
+  out of a set). Outputs are cached next to the download; bump `_RACK_VERSION` /
+  `_EXTRACT_VERSION` when changing that processing.
+- Config: `TubeTransfer` in `assembly_tasks_cfg.py`, `XArmTubeTransferCfg` in `xarm_env_cfg.py`.
+  Gym ids `XArm-TubeTransfer-Residual` and `XArm-TubeTransfer-GuidedDiffusion`.
+- Physics and appearance are separate: invisible solid colliders (a cylinder, thick boxes)
+  with the LabUtopia models drawn over them. Do not use the thin-shelled models as colliders.
+- Tested values: tube radius 0.012 m with `gripper_ctrl_clamp = 1.3` (thinner tubes and
+  full squeeze both failed to hold); `table_top_z = -0.0045` (measured).
+- `eval_smolvla.py` and `shared_autonomy.py` still assume RandomBlock.
 
 ## Setup & Installation
 
@@ -22,6 +42,11 @@ uv sync
 ```
 
 The package manager is **uv** (not pip). The Python package is named `residual_copilot` and maps to the `source/` directory (see `pyproject.toml`).
+
+On this machine the repo has no `.venv`; run everything through `scripts/isaac_python.sh`,
+which uses the Isaac Sim venv in `~/Residual_Copilot` (override with `ISAAC_VENV`) but
+imports this repo's `source/` via a `.pypath/` symlink, and sets the `libgomp` `LD_PRELOAD`.
+Running `python` from `~/Residual_Copilot` runs that checkout's code instead.
 
 Running any Isaac Lab environment requires an active **Isaac Sim 5.1.0** / Isaac Lab 2.3.2 runtime — `import residual_copilot` outside that runtime will fail on `pxr`/USD imports.
 
@@ -37,6 +62,7 @@ Config in `.flake8`: max line length 120, max complexity 30, Google-style docstr
 
 ```bash
 python scripts/list_envs.py          # confirm environment registration
+scripts/isaac_python.sh scripts/play.py --task TubeTransfer --pilot kNNPilot --two_cam --headless  # tube transfer smoke run
 ```
 
 ## Training

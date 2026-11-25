@@ -16,6 +16,7 @@ from .xarm_env_cfg import (
     XArmRandomBlockCfg,
     XArmGearMeshGuidedDiffusionCfg, XArmNutThreadGuidedDiffusionCfg, XArmPegInsertGuidedDiffusionCfg,
     XArmThreeBlocksGuidedDiffusionCfg, XArmRandomBlockGuidedDiffusionCfg,
+    XArmTubeTransferCfg, XArmTubeTransferGuidedDiffusionCfg,
 )
 
 """
@@ -132,6 +133,30 @@ gym.register(
     disable_env_checker=True,
     kwargs={
         "env_cfg_entry_point": XArmRandomBlockGuidedDiffusionCfg,
+        "rl_games_cfg_entry_point": f"{agents.__name__}:rl_games_ppo_cfg.yaml",
+    },
+)
+
+##
+# Tube transfer (adaptive motion scaling study).
+##
+
+gym.register(
+    id="XArm-TubeTransfer-Residual",
+    entry_point=f"{__name__}.tube_transfer_env:XArmTubeTransferEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": XArmTubeTransferCfg,
+        "rl_games_cfg_entry_point": f"{agents.__name__}:rl_games_ppo_cfg.yaml",
+    },
+)
+
+gym.register(
+    id="XArm-TubeTransfer-GuidedDiffusion",
+    entry_point=f"{__name__}.tube_transfer_env:XArmTubeTransferGuidedDiffusionEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": XArmTubeTransferGuidedDiffusionCfg,
         "rl_games_cfg_entry_point": f"{agents.__name__}:rl_games_ppo_cfg.yaml",
     },
 )

@@ -11,7 +11,8 @@ from isaaclab.markers import VisualizationMarkersCfg
 from isaaclab.utils.assets import ISAACLAB_NUCLEUS_DIR, ISAAC_NUCLEUS_DIR
 
 from .assembly_tasks_cfg import (
-    AssemblyTask, GearMesh, GearMeshIntent, NutThread, PegInsert, ThreeBlocks, RandomBlock, HF_ASSETS_REPO,
+    AssemblyTask, GearMesh, GearMeshIntent, NutThread, PegInsert, ThreeBlocks, RandomBlock, TubeTransfer,
+    HF_ASSETS_REPO,
 )
 from ..utils.utils import resolve_hf
 
@@ -415,6 +416,18 @@ class XArmNutThreadCfg(XArmEnvCfg):
     episode_length_s = 40.0
 
 
+@configclass
+class XArmTubeTransferCfg(XArmEnvCfg):
+    task_name = "tube_transfer"
+    task = TubeTransfer()
+    episode_length_s = 60.0
+    # Debug markers render into camera frames, so they are off unless asked for.
+    vis: VisualizationCfg = VisualizationCfg(vis_obs=False)
+    # Layouts are sampled by the task itself; the base class's 2 cm trajectory
+    # augmentation would only shift the scene away from the configured positions.
+    dmr: DomainRandCfg = DomainRandCfg(aug_data=False)
+
+
 # --- GuidedDiffusion variants (8D absolute actions) ---
 
 @configclass
@@ -439,4 +452,9 @@ class XArmThreeBlocksGuidedDiffusionCfg(XArmThreeBlocksCfg):
 
 @configclass
 class XArmRandomBlockGuidedDiffusionCfg(XArmRandomBlockCfg):
+    action_space: int = 8
+
+
+@configclass
+class XArmTubeTransferGuidedDiffusionCfg(XArmTubeTransferCfg):
     action_space: int = 8

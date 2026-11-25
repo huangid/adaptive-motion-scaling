@@ -11,7 +11,9 @@ import time
 from isaaclab.app import AppLauncher
 
 parser = argparse.ArgumentParser(description="Play a pilot model, optionally with a copilot on top.")
-parser.add_argument("--task", type=str, required=True, choices=["GearMesh", "GearMeshIntent", "PegInsert", "NutThread", "ThreeBlocks", "RandomBlock"])
+parser.add_argument("--task", type=str, required=True,
+                    choices=["GearMesh", "GearMeshIntent", "PegInsert", "NutThread", "ThreeBlocks", "RandomBlock",
+                             "TubeTransfer"])
 parser.add_argument("--pilot", type=str, required=True,
                     choices=["LaggyPilot", "NoisyPilot", "ExpertPilot", "BCPilot", "kNNPilot", "ReplayPilot", "ResidualPilot", "SpaceMousePilot"],
                     help="Pilot (base) model to run.")
@@ -164,6 +166,10 @@ def _episode_meta_snapshot(env_unwrapped):
         getattr(env_unwrapped, "rb_block_xy", None)
         if getattr(env_unwrapped.cfg_task, "randomize_positions", False) else None
     )
+    # TubeTransfer: where both racks were, and which source hole held the tube.
+    source_rack_xy = getattr(env_unwrapped, "source_rack_xy", None)
+    source_slot = getattr(env_unwrapped, "source_slot", None)
+    dest_rack_xy = getattr(env_unwrapped, "dest_rack_xy", None)
 
     for env_id in range(num_envs):
         if instructions is not None:
@@ -172,6 +178,12 @@ def _episode_meta_snapshot(env_unwrapped):
             snap[env_id]["target_idx"] = int(target_idx[env_id].item())
         if block_xy is not None:
             snap[env_id]["block_xy"] = block_xy[env_id].detach().cpu().tolist()
+        if source_rack_xy is not None:
+            snap[env_id]["source_rack_xy"] = source_rack_xy[env_id].detach().cpu().tolist()
+        if source_slot is not None:
+            snap[env_id]["source_slot"] = int(source_slot[env_id].item())
+        if dest_rack_xy is not None:
+            snap[env_id]["dest_rack_xy"] = dest_rack_xy[env_id].detach().cpu().tolist()
     return snap
 
 
