@@ -1,46 +1,70 @@
 # Policy-Informed Adaptive Motion Scaling for Assisted Teleoperation
 
-Undergraduate research project.
+Undergraduate research project. Full proposal:
+[docs/proposal.pdf](docs/proposal.pdf).
 
 **Research question:** when a single generative robot policy provides both action-level
 assistance and adaptive motion scaling, how do these mechanisms interact to affect speed,
 precision, and the operator's sense of control?
 
-## Idea
+## Background
 
-A vision-language-action model (VLA) trained on teleoperation demonstrations offers two
-distinct ways to assist a human operator:
+Shared autonomy combines human control inputs with autonomous robot assistance to
+improve task performance. One common technique in teleoperation is **motion scaling**,
+which adjusts how much the robot moves in response to human input: higher gains support
+fast, coarse motions, while lower gains support precise manipulation. Most approaches use
+fixed or manually adjusted scaling, though some adapt scaling using task information,
+operator behavior, or learned demonstrations [1, 2, 6].
 
-- **Action blending** changes *what the robot does*: the human's action is partially
-  noised and then denoised toward the learned policy, in the style of
-  *To the Noise and Back* (Yoneda et al., RSS 2023).
-- **Adaptive motion scaling** changes *how much human input moves the robot*: the
-  policy's predicted action chunks (for example, their magnitudes) set the SpaceMouse
-  gain, high for coarse transport and low for precise insertion. Scaling keeps the
-  operator's commanded direction and must work with or without blending.
+Generative robot policies such as vision-language-action models (VLAs) predict future
+actions (*action chunks*) and may offer a more flexible way to inform the appropriate
+movement scale at different task stages. The same policy can also provide action-level
+assistance through partial denoising [4]. These are distinct assistance channels:
+
+- **Action blending changes what the robot does.** The human's action is partially
+  noised and then denoised toward the learned policy.
+- **Motion scaling changes how much human input moves the robot**, without changing its
+  direction.
+
+Unlike systems that alternate between autonomous movement and human intervention [7],
+the operator remains actively involved throughout.
 
 ## Plan
 
-1. **Task.** An Isaac Lab manipulation task that needs both large, coarse motions and
-   small, precise ones, such as carrying objects across a table and inserting them into
-   tight-fitting slots.
-2. **Data and VLA training.** Collect demonstrations with fast transport and slow
-   insertion, then train an action-chunking VLA.
-3. **Two assistance channels from the same VLA.** (a) Partial noising and denoising of
-   the human action; (b) policy-informed SpaceMouse scaling.
-4. **Evaluation: a 2 × 2 study.**
+1. **Task design.** Develop an Isaac Lab manipulation task requiring both large, coarse
+   movements and small, precise movements, such as transporting objects across a table
+   before carefully inserting them into tight-fitting slots.
+2. **Data collection and VLA training.** Collect demonstrations including fast transport
+   and slow insertion motions, and train an action-chunking VLA to predict future robot
+   actions.
+3. **Two assistance channels from the same trained VLA.**
+   - (a) *To the Noise and Back*-style partial noising and denoising, to adjust human
+     actions toward the learned policy [4].
+   - (b) Predicted action chunks (for example, their magnitudes) adapt the SpaceMouse
+     motion scaling. Scaling preserves the operator's directional command and must also
+     work without action blending.
+4. **Evaluation: a 2 × 2 comparison**, enabling action blending and policy-informed
+   adaptive scaling independently.
 
    |                      | No action blending           | With action blending          |
    |----------------------|------------------------------|-------------------------------|
    | **Fixed scaling**    | Standard teleoperation       | Partial denoising only        |
    | **Adaptive scaling** | Policy-informed scaling only | Scaling + partial denoising   |
 
-   Measures: completion time, insertion accuracy, task success, perceived control, and
-   how strongly denoising changes the scaled human command. The question is whether the
-   two channels are complementary or redundant, and whether scaling reduces the
-   corrections blending has to make.
-5. **Related work review.** An annotated list of papers on adaptive motion scaling,
-   learned teleoperation interfaces, and generative-policy shared autonomy.
+   Measures: completion time, insertion accuracy, task success, and **perceived
+   control**, plus how strongly denoising changes the scaled human command. The analysis
+   tests whether the two methods are complementary or redundant, and whether scaling
+   reduces the corrections needed from blending.
+5. **Related work review.** After the initial experiments, search for additional
+   related research on adaptive motion scaling, learned teleoperation interfaces, and
+   generative-policy shared autonomy, and compile a short annotated list of relevant
+   papers and how they relate to the project.
+
+## Expected outcome
+
+A proof of concept showing whether the two policy-informed assistance channels work best
+separately or together, and whether input-level adaptation can preserve a greater sense
+of human control.
 
 ## Status
 
@@ -86,7 +110,7 @@ python scripts/list_envs.py   # confirm environment registration
 2. Wang, Ji & Sun (2023). *An Auto-tuned Motion Scaling Method Based on Visual Recognition.* RCAR.
 3. Tao et al. (2025). *LAMS: LLM-Driven Automatic Mode Switching for Assistive Teleoperation.* HRI.
 4. Yoneda et al. (2023). *To the Noise and Back: Diffusion for Shared Autonomy.* RSS.
-5. Conti & Khatib (2005). *Spanning Large Workspaces Using Small Haptic Devices.*
+5. Conti & Khatib (2005). *Spanning Large Workspaces Using Small Haptic Devices.* Historical context: a different way to deal with motion scaling in teleoperation.
 6. Shi et al. (2025). *Exploring the Synergistic Effects of Teleoperation Scaling Ratio and Learning From Demonstration.* IEEE TASE.
 7. Song et al. (2026). *Assistron: Bayesian Shared Autonomy with Off-the-shelf Vision-Language-Action Models.* arXiv.
 
