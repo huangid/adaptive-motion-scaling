@@ -14,11 +14,13 @@ would go stale as soon as the next demo was recorded.
 
 Alongside the .npy it writes a sidecar "<output>.tasks.json" mapping each npy
 episode index to:
-  - task:       the natural-language instruction (RandomBlock single-target)
+  - task:       the natural-language instruction
   - frames:     path of the copied per-episode RGB directory
   - steps:      number of timesteps kept (== number of frames copied)
   - block_xy:   all three block spawn positions, when recorded
   - target_idx: index of the instructed block, when recorded
+  - source_rack_xy / source_slot / dest_rack_xy: TubeTransfer layout (rack positions and
+    the hole the tube started in), when recorded
   - source/episode: the originating rollout dir + episode name (provenance only)
 
 The sidecar is kept out of the .npy because the kNN loader tensorizes every key
@@ -283,7 +285,7 @@ for ep_dir in ep_dirs:
     }
     if _HUMAN_MODE:
         entry_meta["human_labelled_steps"] = n_human_labelled
-    for key in ("instruction", "block_xy", "target_idx"):
+    for key in ("instruction", "block_xy", "target_idx", "source_rack_xy", "source_slot", "dest_rack_xy"):
         if key in ep_stats:
             entry_meta["task" if key == "instruction" else key] = ep_stats[key]
 

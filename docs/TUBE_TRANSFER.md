@@ -92,6 +92,41 @@ scripts/isaac_python.sh scripts/play.py --task TubeTransfer --pilot SpaceMousePi
 Running `python scripts/play.py` from `~/Residual_Copilot` instead runs that checkout's code,
 which has no TubeTransfer task.
 
+## Collecting demos
+
+`play.py --record` saves one episode per launch into the same folder, overwriting the
+previous one, so use the collection loop instead:
+
+```bash
+scripts/collect_tubetransfer.sh 50     # record until the dataset holds 50 demos
+scripts/collect_tubetransfer.sh 100    # later: top the same dataset up to 100
+```
+
+Each attempt gets a fresh random layout and records both cameras. Successful episodes are
+appended to `logs/data/tubetransfer_demos.npy` (frames under `tubetransfer_demos_frames/`,
+per-demo instruction and layout in `tubetransfer_demos.npy.tasks.json`); failed or timed-out
+attempts are simply recorded again. Re-running with the same target resumes, Ctrl-C stops
+cleanly, and the dataset is backed up to `logs/data/backups/` at each start.
+
+**Demo style:** carry the tube fast and insert it slowly. The policy learns its speeds from
+these demos, and policy-informed motion scaling depends on that contrast.
+
+## Making the training dataset
+
+Turn the collected demos into a LeRobot dataset (the SmolVLA training format), with both
+camera views and each demo's instruction:
+
+```bash
+scripts/isaac_python.sh scripts/npy_to_lerobot.py \
+    --input logs/data/tubetransfer_demos.npy \
+    --repo_id <hf_user>/tubetransfer_demos --root logs/lerobot/tubetransfer_demos \
+    --images --image_names wrist,side
+```
+
+The result has `observation.state` (14), `action` (8), `observation.images.wrist`
+(240 × 320) and `observation.images.side` (360 × 480) at 15 fps. `--root` keeps it local;
+add `--push_to_hub` to upload it. Rebuild it (with `--overwrite`) after collecting more demos.
+
 The first launch downloads the two LabUtopia files (~6 MB) into the Hugging Face cache,
 builds the shortened rack and cuts a single tube out of the TestTube_02 set; later launches
 reuse all of them.
