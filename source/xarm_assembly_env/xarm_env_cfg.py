@@ -420,7 +420,9 @@ class XArmNutThreadCfg(XArmEnvCfg):
 class XArmTubeTransferCfg(XArmEnvCfg):
     task_name = "tube_transfer"
     task = TubeTransfer()
-    episode_length_s = 60.0
+    # Episodes end early on success, so only failed attempts run this long. 90 s leaves room
+    # for careful insertion at low SpaceMouse gain.
+    episode_length_s = 90.0
     # Debug markers render into camera frames, so they are off unless asked for.
     vis: VisualizationCfg = VisualizationCfg(vis_obs=False)
     # Layouts are sampled by the task itself; the base class's 2 cm trajectory

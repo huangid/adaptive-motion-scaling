@@ -55,7 +55,8 @@ Settings live in `TubeTransfer` (`source/xarm_assembly_env/assembly_tasks_cfg.py
 **Success:** the tube's bottom is inside the destination hole and seated (within
 `seat_tolerance` of the table), it is upright (`upright_tolerance_deg`), and the gripper has
 let go (`release_gripper_thresh`). **Failure:** the tube tips past `tipped_deg` or falls off
-the table. Episodes last 60 s.
+the table. Episodes last up to 90 s (`episode_length_s` in `XArmTubeTransferCfg`); they end
+early on success or failure.
 
 Debug markers are off by default for this task: they render into camera frames, so they
 must never appear in recorded demos.

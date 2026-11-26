@@ -553,7 +553,7 @@ class TubeTransfer(AssemblyTask):
     """
 
     name = "tube_transfer"
-    duration_s = 60.0
+    duration_s = 90.0   # informational; the env reads XArmTubeTransferCfg.episode_length_s
     instruction: str = "move the test tube to the empty rack"
 
     # --- Tube (collider: solid cylinder) ---
