@@ -753,6 +753,13 @@ def main():
                                 "action.fingertip_quat":       ea[3:7].tolist(),
                                 "action.gripper":              ea[7:8].tolist(),
                             })
+                            # SpaceMouse demos: how hard the operator pushed (raw input,
+                            # each axis in [-1, 1]) and the gain it was scaled by. Not used
+                            # for training; kept so human speed modulation can be analysed.
+                            raw_in = getattr(env_unwrapped.pilot, "last_raw_pos", None)
+                            if raw_in is not None:
+                                robot_buffers[env_id][-1]["raw_input"] = [float(v) for v in raw_in]
+                                robot_buffers[env_id][-1]["gain"] = float(env_unwrapped.pilot.pos_scale)
 
                             if store_rgb:
                                 for _a, _sub in _enabled_camera_views(env_unwrapped):

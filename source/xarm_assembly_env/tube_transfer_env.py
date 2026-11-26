@@ -260,7 +260,9 @@ class XArmTubeTransferEnv(XArmEnv):
     def _init_pilot(self):
         """Pilots without a demo file: the SpaceMouse, or a pose-holding placeholder."""
         if self.cfg.pilot_model == "spacemouse":
-            self.pilot = SpaceMousePilot(num_envs=self.num_envs, device=self.device)
+            # Hold the commanded orientation: re-anchoring to the measured one lets the
+            # gripper drift and tilt the held tube (see SpaceMousePilot.hold_orientation).
+            self.pilot = SpaceMousePilot(num_envs=self.num_envs, device=self.device, hold_orientation=True)
         elif self.cfg.pilot_model in ("knn", "replay"):
             print(f"[TubeTransfer] no demo data yet: pilot_model={self.cfg.pilot_model!r} "
                   "runs a placeholder that holds the current pose", flush=True)

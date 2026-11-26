@@ -79,6 +79,9 @@ models over invisible solid colliders. Design, settings and commands:
 scripts/isaac_python.sh scripts/play.py --task TubeTransfer --pilot SpaceMousePilot --num_envs 1 --two_cam
 ```
 
+Step 3 has started: policy-informed **adaptive motion scaling** runs in
+`scripts/assisted_teleop.py` (action blending is next); see [docs/ASSISTANCE.md](docs/ASSISTANCE.md).
+
 The rest of the inherited codebase (see below) has not yet been adapted.
 
 ## Starting point

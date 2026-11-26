@@ -31,6 +31,16 @@ placed at random each episode. Full design, settings and rationale: `docs/TUBE_T
 - Tested values: tube radius 0.012 m with `gripper_ctrl_clamp = 1.3` (thinner tubes and
   full squeeze both failed to hold); `table_top_z = -0.0045` (measured).
 - `eval_smolvla.py` and `shared_autonomy.py` still assume RandomBlock.
+- The SpaceMouse pilot runs with `hold_orientation=True` for this task: re-anchoring the
+  target orientation to the measured one made the gripper (and held tube) drift and tilt.
+
+## Assistance (this project)
+
+`source/assist/` (package `residual_copilot.assist`) and `scripts/assisted_teleop.py`: the
+2 × 2 study runner. `scaling.py` has `FixedScaler` / `AdaptiveScaler` (gain from the
+predicted chunk's planned speed); `predictors.py` has `SmolVLAPredictor` and the
+**test-only** `OraclePredictor`; `sim_operator.py` is a **test-only** scripted operator.
+Action blending (partial denoising) is not implemented yet. See `docs/ASSISTANCE.md`.
 
 ## Setup & Installation
 

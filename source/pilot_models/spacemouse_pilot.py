@@ -23,8 +23,21 @@ def _to_int16(lo, hi):
 class SpaceMousePilot:
     def __init__(self, cfg_path=None, data_path=None, num_envs=1,
                  device="cpu", replay_mode=False,
-                 pos_scale=0.15, rot_scale=0.3, vendor=0x256f, product=0xc635):
+                 pos_scale=0.15, rot_scale=0.3, vendor=0x256f, product=0xc635,
+                 hold_orientation=False):
+        """
+        Args:
+            hold_orientation: integrate rotation input onto the pilot's own commanded
+                orientation instead of the measured one. With False (the original
+                behaviour) the target orientation is re-anchored to wherever the gripper
+                is each step, so any disturbance (a contact, controller compliance) is
+                never undone and the gripper drifts: on the tube task it tilted ~2.5 deg
+                every 4 s while held. True keeps the commanded orientation fixed unless
+                the operator rotates, and the arm is pulled back to it.
+        """
         self._device = device
+        self.hold_orientation = hold_orientation
+        self._cmd_quat = None
         self._num_envs = num_envs
         self.pos_scale = pos_scale
         self.rot_scale = rot_scale
@@ -85,25 +98,38 @@ class SpaceMousePilot:
         with self._lock:
             self._pos = np.zeros(3)
             self._rot = np.zeros(3)
+        self._cmd_quat = None       # re-anchored to the measured orientation on the next call
 
     def clear(self, env_ids=None):
         self.reset()
 
-    def get_actions(self, eidx, pos, quat=None, grip=None, verbose=False):
+    def get_actions(self, eidx, pos, quat=None, grip=None, verbose=False, pos_scale=None):
+        """Target pose = current pose + scaled SpaceMouse input.
+
+        ``pos_scale`` overrides the translation gain for this call (motion scaling);
+        None keeps ``self.pos_scale``. The dead zone is applied to the raw input, so it
+        drops the same small pushes whatever the gain (at the default gain this is
+        identical to applying 0.005 m to the scaled offset). The raw input is kept in
+        ``last_raw_pos`` for logging.
+        """
         N = pos.shape[0]
+        gain = self.pos_scale if pos_scale is None else float(pos_scale)
         with self._lock:
-            dpos = torch.tensor(self._pos * self.pos_scale,
-                                dtype=torch.float32, device=self._device)
+            raw = self._pos.copy()
             drot = self._rot * self.rot_scale
             gval = self._grip
 
+        dz = 0.005
+        raw[np.abs(raw) < dz / self.pos_scale] = 0.0
+        self.last_raw_pos = raw
+        dpos = torch.tensor(raw * gain, dtype=torch.float32, device=self._device)
+
         if _SM_DEBUG:
             print("SM cmd:", dpos.cpu().numpy(), drot, file=sys.stderr, flush=True)
-
-        dz = 0.005
-        dpos[dpos.abs() < dz] = 0.0
         drot_arr = np.where(np.abs(drot) < dz, 0.0, drot)
-        self.is_idle = bool((dpos.abs() < dz).all()) and bool((np.abs(drot_arr) < dz).all())
+        # Idle = no translation input past the dead zone (judged on the raw input, so a low
+        # gain cannot make a real push look idle) and no rotation.
+        self.is_idle = bool((raw == 0.0).all()) and bool((np.abs(drot_arr) < dz).all())
 
         new_pos = pos + dpos.unsqueeze(0).expand(N, -1)
 
@@ -111,11 +137,20 @@ class SpaceMousePilot:
             quat = torch.zeros((N, 4), device=self._device)
             quat[:, 0] = 1.0
 
+        if self.hold_orientation:
+            if self._cmd_quat is None or self._cmd_quat.shape[0] != N:
+                self._cmd_quat = quat.detach().clone().to(self._device)
+            base_quat = self._cmd_quat
+        else:
+            base_quat = quat
+
         dq = Rotation.from_rotvec(drot_arr).as_quat()
         dq = torch.tensor([dq[3], dq[0], dq[1], dq[2]],
                           dtype=torch.float32, device=self._device)
-        new_quat = self._quat_mul(dq.unsqueeze(0).expand(N, -1), quat)
+        new_quat = self._quat_mul(dq.unsqueeze(0).expand(N, -1), base_quat)
         new_quat = new_quat / new_quat.norm(dim=-1, keepdim=True).clamp_min(1e-8)
+        if self.hold_orientation:
+            self._cmd_quat = new_quat.detach().clone()
 
         new_grip = torch.full((N, 1), gval, dtype=torch.float32, device=self._device)
         return torch.cat([new_pos, new_quat, new_grip], dim=-1)

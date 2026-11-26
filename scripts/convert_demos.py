@@ -170,6 +170,22 @@ ACT_DST_KEYS = ["action.fingertip_pos", "action.fingertip_quat", "action.gripper
 # Keys we accumulate per timestep (ACT_SRC_KEYS names the action slots; in selection
 # mode their VALUES may come from a different stream per step).
 ALL_SRC_KEYS = OBS_KEYS + ACT_SRC_KEYS + (_POLICY_KEYS if _HUMAN_MODE else [])
+# Optional per-step signals, carried into the .npy when every kept step has them (e.g. the
+# raw SpaceMouse input and gain that play.py records for SpaceMouse demos). Not training
+# inputs: npy_to_lerobot reads only its own named keys.
+EXTRA_KEYS = ["raw_input", "gain"]
+
+
+def extra_arrays(entries):
+    """{key: (T, ...) array} for each EXTRA_KEYS key present in every kept step."""
+    out = {}
+    for k in EXTRA_KEYS:
+        vals = [e.get(k) for e in entries]
+        if vals and all(v is not None for v in vals):
+            out[k] = np.array(vals, dtype=np.float32)
+    return out
+
+
 # Keys a timestep must contain to be usable — a superset, since D_human reads
 # exec_action.gripper without buffering it under its own name.
 REQUIRED_KEYS = ALL_SRC_KEYS + (["exec_action.gripper"] if args.action_prefix == "human" else [])
@@ -207,6 +223,7 @@ for ep_dir in ep_dirs:
         continue
 
     buffers = {k: [] for k in ALL_SRC_KEYS}
+    kept_entries = []   # raw step dicts, for EXTRA_KEYS
     kept_step_idx = []  # original timestep index of each kept step, for frame alignment
     n_human_labelled = 0
     for t, sf in enumerate(step_files):
@@ -229,6 +246,7 @@ for ep_dir in ep_dirs:
         else:
             for k in ALL_SRC_KEYS:
                 buffers[k].append(entry[k])
+        kept_entries.append(entry)
         kept_step_idx.append(t)
 
     # Drop the terminal sample: DirectRLEnv.step() calls _reset_idx() before
@@ -238,6 +256,7 @@ for ep_dir in ep_dirs:
     if not args.keep_last_step and len(kept_step_idx) > 1:
         for k in ALL_SRC_KEYS:
             buffers[k].pop()
+        kept_entries.pop()
         kept_step_idx.pop()
 
     if len(kept_step_idx) < MIN_STEPS:
@@ -248,6 +267,7 @@ for ep_dir in ep_dirs:
     ep_dict = {}
     for k in OBS_KEYS:
         ep_dict[k] = np.array(buffers[k], dtype=np.float32)
+    ep_dict.update(extra_arrays(kept_entries))
     for src, dst in zip(ACT_SRC_KEYS, ACT_DST_KEYS):
         ep_dict[dst] = np.array(buffers[src], dtype=np.float32)
 

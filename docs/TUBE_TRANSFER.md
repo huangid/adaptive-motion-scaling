@@ -61,6 +61,13 @@ early on success or failure.
 Debug markers are off by default for this task: they render into camera frames, so they
 must never appear in recorded demos.
 
+**SpaceMouse orientation hold.** For this task the SpaceMouse pilot keeps its own commanded
+gripper orientation (`SpaceMousePilot(hold_orientation=True)`): rotation input still turns
+the gripper, but without it the arm returns to the commanded orientation. The original
+behaviour re-anchored the target to the measured orientation every step, so contacts and
+controller compliance were never undone: the gripper drifted ~2.5° every 4 s while holding
+the tube, until the tube was too tilted to enter the hole.
+
 Recordings made with `play.py --record` store `source_rack_xy`, `source_slot` (the hole the
 tube started in) and `dest_rack_xy` per episode in `meta/stats.json`.
 
@@ -148,3 +155,5 @@ that shows the task. The files are downloaded at runtime and never committed (th
 - `eval_smolvla.py` and `shared_autonomy.py` still assume RandomBlock (block colours and
   layouts) and need adapting once demos and a trained policy exist.
 - Without a demo file, non-SpaceMouse pilots get a placeholder that holds the arm still.
+- Assisted teleoperation (motion scaling) is in `scripts/assisted_teleop.py`; see
+  [ASSISTANCE.md](ASSISTANCE.md).
